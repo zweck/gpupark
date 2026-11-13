@@ -85,6 +85,7 @@ class Broker:
         self.baseline_state = "unknown"
         self._wake = asyncio.Event()
         self._stopping = False
+        self._exit = asyncio.Event()
         self._server: asyncio.AbstractServer | None = None
 
     # ---------------------------------------------------------------- queue
@@ -380,16 +381,20 @@ class Broker:
                 pass
         print(f"gpupark listening on {sock}", flush=True)
         try:
-            await asyncio.sleep(float("inf"))
+            await self._exit.wait()
         finally:
             task.cancel()
             if self._server:
                 self._server.close()
+                await self._server.wait_closed()
 
     async def shutdown(self) -> None:
+        """Stop scheduling and let `serve` return (SIGTERM/SIGINT land here)."""
+        if self._stopping:
+            return
         self._stopping = True
         if self.running is not None:
             self.cancel(self.running.id)
         if self._server:
             self._server.close()
-        raise SystemExit(0)
+        self._exit.set()

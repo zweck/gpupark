@@ -1,0 +1,20 @@
+# gpupark workloads — copy to ~/.config/gpupark/workloads.yaml
+gpu: 0
+poll_seconds: 0.5
+cooldown_seconds: 5
+
+workloads:
+  tensorfold:
+    kind: unit
+    target: tensorfold-qwen27.service
+    vram_gb: 21
+    baseline: true
+    priority: -10
+  comfyui:
+    kind: unit
+    target: comfyui.service
+    vram_gb: 22
+  game:
+    kind: command
+    target: ["./run-headless.sh"]
+    vram_gb: 8

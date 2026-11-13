@@ -1,0 +1,89 @@
+# gpupark
+
+**One GPU. Many tenants. Lease it, and park what's idle.**
+
+`gpupark` is a single-node GPU lease broker. A resident model (or any service) is
+registered as the *baseline*: it holds the card while nothing else needs it, and
+gives it up the moment a job asks. When the queue drains, the baseline comes back.
+
+It exists because "run ComfyUI next to a 21 GB local LLM on one 24 GB card" has no
+good answer: llama-swap only swaps LLM backends, Slurm/Kueue are cluster schedulers,
+and `flock` scripts cannot stop and restart a resident service.
+
+```
+$ gpupark run --need 22 -- comfy run workflow.json
+queued 3f2a (need 22.0 GB, prio 0) ... granted
+parking baseline tensorfold (systemd unit) ... parked
+gpu free 23.1 GB / 24.0 GB ... starting comfy
+... job output ...
+job exited 0; restoring baseline tensorfold in 5s
+```
+
+## Install
+
+```bash
+pipx install gpupark        # or: uv tool install gpupark
+gpupark install-service     # systemd --user unit for the daemon
+gpupark doctor
+```
+
+## Workloads
+
+`~/.config/gpupark/workloads.yaml`:
+
+```yaml
+gpu: 0
+cooldown_seconds: 5
+
+workloads:
+  tensorfold:
+    kind: unit
+    target: tensorfold-qwen27.service   # systemd --user unit
+    vram_gb: 21
+    baseline: true                      # runs whenever the queue is empty
+    priority: -10
+  comfyui:
+    kind: unit
+    target: comfyui.service
+    vram_gb: 22
+  game:
+    kind: command
+    target: ["./run-headless.sh"]
+    vram_gb: 8
+```
+
+A workload is either a `unit` (systemd --user) or a `command` (argv). Exactly one
+workload may set `baseline: true`; it is started at daemon boot and after every lease.
+
+## CLI
+
+| command | meaning |
+|---|---|
+| `gpupark run --need 22 -- CMD...` | queue an ad-hoc command, wait for the lease, run it |
+| `gpupark lease comfyui --for 1800` | start a registered unit and hold the card for N seconds |
+| `gpupark status` | lease, queue, VRAM, baseline state |
+| `gpupark queue` | pending jobs |
+| `gpupark cancel ID` | drop a queued job or stop a running one |
+| `gpupark doctor` | check nvidia-smi, systemd, units, config |
+| `gpupark daemon` | run the broker in the foreground (what the unit runs) |
+
+## Semantics
+
+- **Exclusive by default.** One lease at a time; the broker verifies with `nvidia-smi`
+  that the requested VRAM is actually free before granting (stopping a service is not
+  the same as its memory being returned).
+- **Priority then FIFO.** Higher `priority` first, ties in submission order.
+- **The baseline is the only workload that may be preempted.** A running job is never
+  evicted by a later arrival.
+- **A dead client does not leak a lease.** The broker owns the process/unit; the lease
+  ends when the job exits, its TTL expires, or `gpupark cancel` stops it.
+- **Crash recovery.** The queue is journaled to `$XDG_RUNTIME_DIR/gpupark/state.json`;
+  on restart, stale leases are dropped and the baseline is restored.
+
+## Status
+
+Milestone 1 (this release): daemon, queue, baseline preemption/restore, CLI, systemd
+integration, tests with a fake GPU. Milestone 2: ComfyUI adapter (hold the lease until
+the prompt finishes), multi-GPU pools, `gpupark top`. Milestone 3: webhooks/metrics.
+
+Apache-2.0.

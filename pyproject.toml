@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpupark"
+version = "0.1.0"
+description = "Lease one GPU to many workloads: queue jobs, evict the idle baseline, restore it when the card is free."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Phil Hauser" }]
+keywords = ["gpu", "scheduler", "queue", "vram", "llm", "comfyui", "single-node"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Distributed Computing",
+]
+dependencies = ["typer>=0.12", "PyYAML>=6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+gpupark = "gpupark.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/REPLACE_ME/gpupark"
+Issues = "https://github.com/REPLACE_ME/gpupark/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpupark"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110

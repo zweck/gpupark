@@ -1,0 +1,249 @@
+"""gpupark command line."""
+
+from __future__ import annotations
+
+import json
+import shutil
+import socket
+import subprocess
+import sys
+from pathlib import Path
+from typing import Iterator, List, Optional
+
+import typer
+
+from . import config as config_mod
+
+app = typer.Typer(no_args_is_help=True, add_completion=False, help="Lease one GPU to many workloads.")
+
+
+# ------------------------------------------------------------------ client
+
+def _socket_path() -> Path:
+    override = None
+    try:
+        override = config_mod.load().socket_path
+    except Exception:
+        pass
+    return Path(override) if override else config_mod.default_socket_path()
+
+
+def _call(payload: dict, stream: bool = False) -> Iterator[dict]:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(str(_socket_path()))
+    except (FileNotFoundError, ConnectionRefusedError) as exc:
+        raise typer.Exit(_fail(f"cannot reach the gpupark daemon ({exc}); run 'gpupark daemon' or start gpupark.service"))
+    with sock.makefile("rwb") as handle:
+        handle.write((json.dumps(payload) + "\n").encode())
+        handle.flush()
+        for line in handle:
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            yield event
+            if not stream:
+                return
+
+
+def _fail(message: str, code: int = 1) -> int:
+    typer.echo(message, err=True)
+    return code
+
+
+# ----------------------------------------------------------------- daemon
+
+@app.command()
+def daemon() -> None:
+    """Run the broker in the foreground (this is what the systemd unit runs)."""
+    import asyncio
+
+    from .daemon import Broker
+
+    cfg = config_mod.load()
+    broker = Broker(cfg)
+    try:
+        asyncio.run(broker.serve())
+    except KeyboardInterrupt:
+        pass
+
+
+@app.command()
+def install_service(force: bool = typer.Option(False, "--force")) -> None:
+    """Install and start a systemd --user unit for the daemon."""
+    unit_dir = Path("~/.config/systemd/user").expanduser()
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    unit = unit_dir / "gpupark.service"
+    if unit.exists() and not force:
+        raise typer.Exit(_fail(f"{unit} exists (pass --force to overwrite)"))
+    unit.write_text(
+        "[Unit]\n"
+        "Description=gpupark GPU lease broker\n"
+        "After=network.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={sys.executable} -m gpupark.cli daemon\n"
+        "Restart=on-failure\n"
+        "RestartSec=2\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "gpupark.service"], check=True)
+    typer.echo(f"installed {unit}")
+
+
+# -------------------------------------------------------------------- jobs
+
+@app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+def run(
+    ctx: typer.Context,
+    need: float = typer.Option(0.0, "--need", help="VRAM the job needs, in GB"),
+    priority: int = typer.Option(0, "--priority", help="higher runs first"),
+    ttl: Optional[float] = typer.Option(None, "--ttl", help="lease time limit, seconds"),
+    quiet: bool = typer.Option(False, "--quiet", help="only stream the job's own output"),
+) -> None:
+    """Queue a command; it runs when the GPU is free."""
+    argv: List[str] = [a for a in ctx.args if a != "--"]
+    if not argv:
+        raise typer.BadParameter("give a command after '--'")
+    code = 0
+    for event in _call(
+        {"op": "submit", "argv": argv, "need_gb": need, "priority": priority, "ttl": ttl}, stream=True
+    ):
+        kind = event.get("ev")
+        if kind == "output":
+            typer.echo(event.get("line", ""))
+        elif kind == "queued" and not quiet:
+            typer.echo(f"queued {event['id']} (need {need:.1f} GB, priority {priority})", err=True)
+        elif kind == "granted" and not quiet:
+            typer.echo("granted", err=True)
+        elif kind in ("done", "failed"):
+            code = int(event.get("exit_code") or 0)
+            if kind == "failed" and event.get("error"):
+                typer.echo(event["error"], err=True)
+                code = code or 1
+            break
+        elif kind in ("cancelled",):
+            code = 130
+            break
+        elif "error" in event:
+            raise typer.Exit(_fail(event["error"]))
+    raise typer.Exit(code)
+
+
+@app.command()
+def lease(
+    workload: str = typer.Argument(..., help="a workload name from workloads.yaml"),
+    ttl: Optional[float] = typer.Option(None, "--for", help="hold for N seconds, then release"),
+) -> None:
+    """Start a registered workload and hold the GPU until this command is interrupted."""
+    for event in _call({"op": "submit", "workload": workload, "ttl": ttl, "hold": True}, stream=True):
+        kind = event.get("ev")
+        if kind == "queued":
+            typer.echo(f"queued {event['id']}", err=True)
+        elif kind == "granted":
+            typer.echo(f"{workload} holds the GPU; Ctrl-C to release", err=True)
+        elif kind in ("done", "failed", "cancelled"):
+            break
+        elif "error" in event:
+            raise typer.Exit(_fail(event["error"]))
+
+
+@app.command()
+def cancel(job_id: str) -> None:
+    """Cancel a queued job or stop a running one."""
+    for event in _call({"op": "cancel", "id": job_id}):
+        typer.echo("cancelled" if event.get("cancelled") else f"no such live job: {job_id}")
+        raise typer.Exit(0 if event.get("cancelled") else 1)
+
+
+# ------------------------------------------------------------------ views
+
+@app.command()
+def status(as_json: bool = typer.Option(False, "--json")) -> None:
+    """Show the lease, the queue, and the GPU."""
+    for snapshot in _call({"op": "status"}):
+        if as_json:
+            typer.echo(json.dumps(snapshot, indent=2))
+            return
+        running = snapshot.get("running")
+        gpu_view = snapshot.get("gpu", {})
+        meta = snapshot.get("baseline", {})
+        if "free_mib" in gpu_view:
+            typer.echo(
+                f"gpu {gpu_view['index']}: {gpu_view['used_mib'] / 1024:.1f} GB used of "
+                f"{gpu_view['total_mib'] / 1024:.1f} GB ({gpu_view['free_mib'] / 1024:.1f} GB free)"
+            )
+        else:
+            typer.echo(f"gpu {gpu_view.get('index')}: {gpu_view.get('error', 'unknown')}")
+        typer.echo(f"baseline: {meta.get('name') or '-'} ({meta.get('state')})")
+        if running:
+            what = running.get("workload") or " ".join(running.get("argv") or [])
+            typer.echo(f"lease: {running['id']} {what} (need {running['need_gb']:.1f} GB)")
+        else:
+            typer.echo("lease: free")
+        queue = snapshot.get("queue") or []
+        typer.echo(f"queue: {len(queue)}")
+        for job in queue:
+            what = job.get("workload") or " ".join(job.get("argv") or [])
+            typer.echo(f"  {job['id']}  {what}  (need {job['need_gb']:.1f} GB)")
+
+
+@app.command()
+def workloads() -> None:
+    """List the configured workloads."""
+    cfg = config_mod.load()
+    for name in sorted(cfg.workloads):
+        item = cfg.workloads[name]
+        target = item.target if isinstance(item.target, str) else " ".join(item.argv())
+        flags = []
+        if item.baseline:
+            flags.append("baseline")
+        if item.vram_gb:
+            flags.append(f"{item.vram_gb:g} GB")
+        typer.echo(f"{name:<16} {item.kind:<8} {target}  {', '.join(flags)}")
+
+
+@app.command()
+def doctor() -> None:
+    """Check the things a lease depends on."""
+    problems = 0
+    cfg_path = config_mod.default_config_path()
+    if Path(cfg_path).exists():
+        typer.echo(f"ok    config {cfg_path}")
+    else:
+        problems += 1
+        typer.echo(f"FAIL  config missing: {cfg_path} (copy workloads.example.yaml)")
+    if shutil.which("nvidia-smi"):
+        try:
+            from . import gpu
+
+            total, used = gpu.memory(0)
+            typer.echo(f"ok    nvidia-smi: {used} / {total} MiB used")
+        except Exception as exc:
+            problems += 1
+            typer.echo(f"FAIL  nvidia-smi: {exc}")
+    else:
+        problems += 1
+        typer.echo("FAIL  nvidia-smi not on PATH")
+    if shutil.which("systemctl"):
+        result = subprocess.run(["systemctl", "--user", "is-system-running"], capture_output=True, text=True)
+        state = (result.stdout or result.stderr).strip() or "unknown"
+        typer.echo(f"ok    systemd --user: {state}")
+    else:
+        problems += 1
+        typer.echo("FAIL  systemctl not on PATH")
+    try:
+        for event in _call({"op": "ping"}):
+            typer.echo("ok    daemon reachable" if event.get("pong") else "FAIL  daemon: bad reply")
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        problems += 1
+        typer.echo(f"FAIL  daemon unreachable: {exc}")
+    raise typer.Exit(1 if problems else 0)
+
+
+if __name__ == "__main__":
+    app()

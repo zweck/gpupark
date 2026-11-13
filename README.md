@@ -15,13 +15,15 @@ good answer: llama-swap only swaps LLM backends, Slurm/Kueue are cluster schedul
 and `flock` scripts cannot stop and restart a resident service.
 
 ```
-$ gpupark run --need 22 -- comfy run workflow.json
-queued 3f2a (need 22.0 GB, prio 0) ... granted
-parking baseline tensorfold (systemd unit) ... parked
-gpu free 23.1 GB / 24.0 GB ... starting comfy
-... job output ...
-job exited 0; restoring baseline tensorfold in 5s
+$ gpupark run --need 22 --ttl 1800 -- comfy run workflow.json
+queued 3f2a (need 22.0 GB, priority 0)
+granted
+... the job's own output ...
 ```
+
+The broker parks the baseline before the job starts and restarts it when the queue
+drains; every request is logged as one line (`gpupark: uid=1000 pid=4812 submit comfy …`),
+which is the only audit trail.
 
 ## Install
 
@@ -40,8 +42,11 @@ gpupark doctor              # check nvidia-smi, systemd, the daemon
 gpupark install-service     # Linux: run the broker as a systemd --user unit
 ```
 
-Uninstall with `curl -fsSL .../install.sh | sh -s -- --uninstall`. If you already
-have pipx or uv, `pipx install gpupark` / `uv tool install gpupark` work too.
+Uninstall with `curl -fsSL .../install.sh | sh -s -- --uninstall`; it refuses to delete
+anything that is not a gpupark install and leaves a foreign `gpupark` binary alone.
+The installer pins the latest release tag — set `GPUPARK_ALLOW_CUSTOM_SOURCE=1` to
+override `GPUPARK_REF`/`GPUPARK_REPO`. Not on PyPI yet, so `pip install gpupark` will
+not find it.
 
 macOS: there is no `nvidia-smi`, so set `gpu_probe: none` in the config — the
 queue still serialises jobs, it just cannot check VRAM. `gpupark daemon` runs in
@@ -116,7 +121,7 @@ workload may set `baseline: true`; it is started at daemon boot and after every 
 | `gpupark cancel ID` | drop a queued job or stop a running one |
 | `gpupark pause [ID]` | hand the card back; keep the lease and the queue place |
 | `gpupark resume [ID]` | re-grant a paused lease, or requeue a paused job |
-| `gpupark doctor` | check nvidia-smi, systemd, units, config |
+| `gpupark doctor` | check the config, nvidia-smi, systemd and the daemon |
 | `gpupark daemon` | run the broker in the foreground (what the unit runs) |
 
 ## Semantics
@@ -127,13 +132,31 @@ workload may set `baseline: true`; it is started at daemon boot and after every 
 - **Priority then FIFO.** Higher `priority` first, ties in submission order.
 - **The baseline is the only workload that may be preempted.** A running job is never
   evicted by a later arrival.
-- **The TTL is running time, not wall time.** A job past its `--ttl` is stopped the same
-  way `cancel` stops it (a unit is stopped, a command is terminated), and time spent
-  paused is subtracted before that deadline is checked.
-- **A dead client does not leak a lease.** The broker owns the process/unit; the lease
-  ends when the job exits, its TTL expires, or `gpupark cancel` stops it.
-- **Crash recovery.** The queue is journaled to `$XDG_RUNTIME_DIR/gpupark/state.json`;
-  on restart, stale leases are dropped and the baseline is restored.
+- **The TTL is running time, not wall time.** Time spent paused is subtracted before the
+  deadline is checked. A command job stopped by its `--ttl` exits **124** with `lease
+  expired`; a unit lease that reaches its `--for` simply ends.
+- **A lease belongs to its client; a job belongs to the broker.** Closing the client that
+  ran `gpupark lease` (Ctrl-C) releases the lease. A `gpupark run` job keeps running when its
+  client goes away — stop it with `gpupark cancel <id>`.
+- **Crash behaviour: the queue is in memory.** A `kill -9` of the broker loses queued jobs
+  and can leave a running child or unit behind with no owner (the socket is stale, and the
+  next start removes it). Restart the broker and check `gpupark status` for leftovers;
+  journaling is not implemented yet.
+
+## Security model
+
+- **The socket is the whole boundary.** `$XDG_RUNTIME_DIR/gpupark.sock`, mode `0600`, inside a
+  `0700` directory. There is no authentication: **whoever can connect can run commands as the
+  user the broker runs as**, cancel or pause any job, and start/stop the configured units.
+  gpupark is a single-user tool — do not share the socket with another user, and do not run
+  the broker as root.
+- **One broker per socket.** The daemon holds a `gpupark.lock` beside the socket and refuses
+  to start when another broker has it, so a second daemon cannot take over the socket.
+- **Jobs are not sandboxed.** They run as the broker's user, inherit its environment, and get
+  no rlimits or VRAM enforcement after the grant. A job that needs isolation needs a
+  container, not gpupark.
+- **Every request is logged** as one line with the peer's uid and pid — that log is the only
+  audit trail.
 
 ## Status
 

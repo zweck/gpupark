@@ -49,11 +49,12 @@ gpupark lease comfyui --for 1800          # hold a registered unit (e.g. a UI se
   high blocks the queue behind a card that will never be that empty; too low and
   your job OOMs after the baseline was already parked.
 - `--ttl` is the lease ceiling in seconds. Always set it for renders and training
-  runs. When it expires the broker stops your workload and restores the baseline.
+  runs. When it expires the broker stops your workload and restores the baseline; a
+  command job stopped this way exits **124** with `lease expired`, not 0.
 - `--priority` is higher-first, FIFO on ties. Leave it at 0 unless the human asked
   you to jump the queue.
 - The command's stdout/stderr stream to you and its exit code becomes `gpupark`'s.
-  A non-zero exit means the job failed, not that the broker did.
+  A non-zero exit means the job failed (or hit its TTL), not that the broker did.
 
 ## Pausing and resuming
 
@@ -76,7 +77,7 @@ instead of the CPU, `gpupark cancel` and resubmit.
    service is not instantly a freed card, so this can take a few seconds.
 3. Your workload starts and holds the exclusive lease.
 4. On exit, TTL expiry, or `gpupark cancel`, the workload is stopped, a cooldown
-   passes, and the baseline is restarted. Restarting a 27B model takes ~30-60 s;
+   passes, and the baseline is restarted. Restarting a resident model takes ~30-60 s;
    the card is idle during that time, not yours.
 
 ## When to ask the human
@@ -104,10 +105,15 @@ a loop.
   start a second `gpupark run` expecting them to share: the lease is exclusive.
 - Do not poll `nvidia-smi` to decide when to start. Submit to gpupark; it already
   waits for the memory and will tell you when it is granted.
-- A client Ctrl-C cancels the job (the daemon terminates the process), so do not
-  interrupt a `gpupark run` you want to keep.
-- Jobs are children of the daemon: closing your terminal does **not** kill a
-  granted job. Use `gpupark cancel <id>` when you mean it.
+- A client Ctrl-C behaves differently per command. On `gpupark lease` it **releases
+  the lease** (the broker sees the disconnect and cancels the job). On `gpupark run`
+  it only stops watching: the job belongs to the broker and keeps running, so use
+  `gpupark cancel <id>` when you mean it.
+- Jobs are children of the daemon, not of your shell: closing your terminal does
+  **not** kill a granted `run` job. Use `gpupark cancel <id>` to stop it.
+- The socket is a "run commands as this user" interface with no authentication. Never
+  point `socket_path` at a shared directory, never connect to another user's broker,
+  and treat any process that can reach the socket as having your privileges.
 - `gpupark status --json` is the machine-readable form; prefer it over parsing text.
 
 ## Machine-readable facts

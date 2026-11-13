@@ -24,18 +24,18 @@ def _systemctl(*args: str, timeout: float = 30) -> subprocess.CompletedProcess:
 
 
 def is_active(unit: str) -> bool:
-    result = _systemctl("is-active", unit, timeout=10)
+    result = _systemctl("is-active", "--", unit, timeout=10)
     return result.stdout.strip() in ("active", "activating", "reloading")
 
 
 def start(unit: str) -> None:
-    result = _systemctl("start", "--no-block", unit)
+    result = _systemctl("start", "--no-block", "--", unit)
     if result.returncode != 0:
         raise SystemdError(f"could not start {unit}: {result.stderr.strip() or result.stdout.strip()}")
 
 
 def stop(unit: str) -> None:
-    result = _systemctl("stop", "--no-block", unit)
+    result = _systemctl("stop", "--no-block", "--", unit)
     if result.returncode != 0:
         # stopping an inactive unit is not an error worth failing a lease over
         message = (result.stderr or result.stdout).strip()

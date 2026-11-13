@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import os
 import signal
+import socket
+import stat as stat_mod
+import struct
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -15,6 +19,8 @@ from typing import Any
 
 from . import config as config_mod
 from . import gpu, systemd
+
+EVENTS_MAX = 4096  # bounded per-job buffer: a client that stops reading cannot OOM the broker
 
 
 @dataclass
@@ -37,11 +43,18 @@ class Job:
     pause_request: bool = False
     suspended: bool = False  # command jobs: SIGSTOP sent
     proc: Any = None  # asyncio.subprocess.Process for command jobs
-    events: asyncio.Queue = field(default_factory=asyncio.Queue)
+    pgid: int | None = None  # process group captured at spawn (never re-derived after exit)
+    dropped: int = 0  # output lines dropped because nobody was reading
+    events: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=EVENTS_MAX))
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
 
     def emit(self, event: str, **fields: Any) -> None:
-        self.events.put_nowait({"ev": event, "id": self.id, **fields})
+        try:
+            self.events.put_nowait({"ev": event, "id": self.id, **fields})
+        except asyncio.QueueFull:
+            # lifecycle events matter, output lines do not: drop the line and count it
+            self.dropped += 1
+
 
     def active_seconds(self, now: float | None = None) -> float:
         """Wall time this job has been running, excluding time spent paused."""
@@ -106,10 +119,13 @@ class Broker:
         self.order: list[str] = []
         self.running: Job | None = None
         self.baseline_state = "unknown"
+        self.scheduler_alive = False
+        self.last_error: str | None = None
         self._wake = asyncio.Event()
         self._stopping = False
         self._exit = asyncio.Event()
         self._server: asyncio.AbstractServer | None = None
+        self._lock_fd: int | None = None
 
     # ---------------------------------------------------------------- queue
 
@@ -208,6 +224,12 @@ class Broker:
             return {"ok": True, "state": job.state, "note": "resuming"}
         return {"ok": False, "error": f"job {job_id} is not paused (state {job.state})"}
 
+    def _forget(self, job: Job) -> None:
+        """Drop a finished job and its buffered events: a long-lived broker must not grow."""
+        self.jobs.pop(job.id, None)
+        with contextlib.suppress(ValueError):
+            self.order.remove(job.id)
+
     def _next_job(self) -> Job | None:
         pending = [self.jobs[j] for j in self.order if self.jobs[j].state == "queued"]
         if not pending:
@@ -215,9 +237,10 @@ class Broker:
         pending.sort(key=lambda j: (-j.priority, j.submitted_at))
         return pending[0]
 
-    def status(self) -> dict[str, Any]:
+    async def status(self) -> dict[str, Any]:
         try:
-            total, used = self.host.gpu_memory(self.cfg.gpu)
+            # nvidia-smi can take seconds; never block the event loop for it
+            total, used = await asyncio.to_thread(self.host.gpu_memory, self.cfg.gpu)
             gpu_view: dict[str, Any] = {
                 "index": self.cfg.gpu,
                 "total_mib": total,
@@ -239,20 +262,40 @@ class Broker:
                 "state": self.baseline_state,
             },
             "gpu": gpu_view,
+            "scheduler": {"alive": self.scheduler_alive, "last_error": self.last_error},
         }
 
     # ------------------------------------------------------------ scheduling
 
+    def _note_error(self, exc: BaseException) -> None:
+        """Remember the last host-layer problem; status exposes it, the loop survives it."""
+        self.last_error = f"{time.strftime('%Y-%m-%d %H:%M:%S')}: {exc}"
+        print(f"gpupark: {exc}", flush=True)
+
     async def _scheduler(self) -> None:
-        await self._restore_baseline()
-        while not self._stopping:
-            job = self._next_job()
-            if job is None:
-                self._wake.clear()
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self._wake.wait(), timeout=1.0)
-                continue
-            await self._run(job)
+        """Run the queue forever. A host-layer hiccup must never kill the loop."""
+        self.scheduler_alive = True
+        try:
+            try:
+                await self._restore_baseline()
+            except Exception as exc:  # noqa: BLE001 - the loop must outlive its first restore
+                self._note_error(exc)
+            while not self._stopping:
+                try:
+                    job = self._next_job()
+                    if job is None:
+                        self._wake.clear()
+                        with contextlib.suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(self._wake.wait(), timeout=1.0)
+                        continue
+                    await self._run(job)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - systemctl timeout, stale pid, ...
+                    self._note_error(exc)
+                    await asyncio.sleep(1.0)
+        finally:
+            self.scheduler_alive = False
 
     async def _restore_baseline(self) -> None:
         baseline = self.cfg.baseline()
@@ -262,12 +305,14 @@ class Broker:
             # a command baseline cannot be meaningfully kept by the broker yet
             self.baseline_state = "unsupported"
             return
-        if not await asyncio.to_thread(self.host.is_active, str(baseline.target)):
-            try:
+        try:
+            active = await asyncio.to_thread(self.host.is_active, str(baseline.target))
+            if not active:
                 await asyncio.to_thread(self.host.start_unit, str(baseline.target))
-            except Exception as exc:
-                self.baseline_state = f"error: {exc}"
-                return
+        except Exception as exc:
+            self.baseline_state = f"error: {exc}"
+            self._note_error(exc)
+            return
         self.baseline_state = "running"
 
     async def _park_baseline(self) -> None:
@@ -275,11 +320,15 @@ class Broker:
         if baseline is None or baseline.kind != "unit":
             return
         unit = str(baseline.target)
-        if not await asyncio.to_thread(self.host.is_active, unit):
-            self.baseline_state = "parked"
+        try:
+            active = await asyncio.to_thread(self.host.is_active, unit)
+            if active:
+                await asyncio.to_thread(self.host.stop_unit, unit)
+                await asyncio.to_thread(self.host.wait_inactive, unit, baseline.stop_timeout)
+        except Exception as exc:
+            self.baseline_state = f"error: {exc}"
+            self._note_error(exc)
             return
-        await asyncio.to_thread(self.host.stop_unit, unit)
-        await asyncio.to_thread(self.host.wait_inactive, unit, baseline.stop_timeout)
         self.baseline_state = "parked"
 
     async def _wait_free(self, need_gb: float, timeout: float) -> bool:
@@ -330,6 +379,7 @@ class Broker:
                 job.emit(job.state, exit_code=job.exit_code, error=job.error)
             else:
                 job.emit("cancelled")
+            self._forget(job)
             if workload is not None and workload.kind == "unit" and not job.hold:
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(self.host.stop_unit, str(workload.target))
@@ -381,6 +431,8 @@ class Broker:
             start_new_session=True,  # own process group, so pause reaches the whole tree
         )
         job.proc = proc
+        with contextlib.suppress(ProcessLookupError):
+            job.pgid = os.getpgid(proc.pid)
 
         async def pump() -> None:
             assert proc.stdout is not None
@@ -389,15 +441,15 @@ class Broker:
 
         async def watch_pause() -> None:
             """SIGSTOP/SIGCONT the job's process group. VRAM stays allocated."""
-            while proc.returncode is None:
+            while proc.returncode is None and job.pgid is not None:
                 try:
                     if job.pause_request and not job.suspended:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGSTOP)
+                        os.killpg(job.pgid, signal.SIGSTOP)
                         job.suspended = True
                     elif not job.pause_request and job.suspended:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGCONT)
+                        os.killpg(job.pgid, signal.SIGCONT)
                         job.suspended = False
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     return
                 await asyncio.sleep(0.2)
 
@@ -411,43 +463,117 @@ class Broker:
         cancel_task = asyncio.create_task(job.cancel.wait())
         pause_task = asyncio.create_task(watch_pause())
         ttl_task = asyncio.create_task(watch_ttl()) if job.ttl else None
+
+        async def finish_pump() -> None:
+            """Let the reader drain, but never wait forever on a pipe a grandchild holds open."""
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(pump_task), timeout=2.0)
+            pump_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pump_task
+
         waiting = {wait_task, cancel_task} | ({ttl_task} if ttl_task else set())
         done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
         pause_task.cancel()
         if ttl_task:
             ttl_task.cancel()
-        if job.suspended:  # never leave a stopped process behind
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGCONT)
-            job.suspended = False
         if cancel_task in done and not wait_task.done():
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=10)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-            await pump_task
+            await self._stop_job(job, proc, signal.SIGTERM)
+            await finish_pump()
             raise asyncio.CancelledError()
         if ttl_task is not None and ttl_task in done and not wait_task.done():
-            # lease expired: stop the job the same way a unit workload is stopped
-            proc.terminate()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(proc.wait(), timeout=10)
-            await pump_task
-            return 0
-        await pump_task
+            # lease expired: stop the job tree, and say so instead of reporting success
+            job.error = f"lease expired after {job.ttl:.0f}s (--ttl); the job was terminated"
+            await self._stop_job(job, proc, signal.SIGTERM)
+            await finish_pump()
+            return 124
+        await finish_pump()
         return proc.returncode or 0
+
+    async def _stop_job(self, job: Job, proc: Any, sig: int) -> None:
+        """Stop the whole process group (not just the direct child), then make sure it is gone."""
+
+        def signal_group(how: int) -> None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                if job.pgid is not None:
+                    os.killpg(job.pgid, how)
+                else:
+                    proc.send_signal(how)
+
+        if job.suspended:  # SIGTERM is not delivered to a stopped process
+            signal_group(signal.SIGCONT)
+            job.suspended = False
+        signal_group(sig)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        if proc.returncode is None:
+            signal_group(signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=5)
 
     # -------------------------------------------------------------- service
 
+    @staticmethod
+    def _peer(writer: asyncio.StreamWriter) -> str:
+        """Who is on the other end (uid/pid via SO_PEERCRED), for the request log."""
+        try:
+            sock = writer.get_extra_info("socket")
+            creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+            pid, uid, _gid = struct.unpack("3i", creds)
+            return f"uid={uid} pid={pid}"
+        except Exception:
+            return "uid=?"
+
+    @staticmethod
+    def _check_request(request: dict[str, Any]) -> None:
+        """Reject wire types the broker cannot honour (a string ttl used to kill jobs)."""
+        argv = request.get("argv")
+        if argv is not None and (
+            not isinstance(argv, list) or not all(isinstance(part, str) for part in argv)
+        ):
+            raise ValueError("argv must be a list of strings")
+        for key in ("ttl", "need_gb"):
+            value = request.get(key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+                raise ValueError(f"{key} must be a number")
+        hold = request.get("hold", False)
+        if not isinstance(hold, bool):
+            raise ValueError("hold must be true or false")
+        priority = request.get("priority", 0)
+        if priority is not None and (isinstance(priority, bool) or not isinstance(priority, int)):
+            raise ValueError("priority must be an integer")
+
+    def _log(self, writer: asyncio.StreamWriter, op: str, request: dict[str, Any]) -> None:
+        """One line per request, with the peer's uid: the broker keeps no other audit trail."""
+        detail = (
+            request.get("workload")
+            or " ".join(request.get("argv") or [])
+            or request.get("id")
+            or "-"
+        )
+        print(f"gpupark: {self._peer(writer)} {op} {str(detail)[:160]}", flush=True)
+
+    async def _watch_client(self, reader: asyncio.StreamReader, job: Job) -> None:
+        """A lease whose client hangs up (Ctrl-C) is released instead of leaking the card."""
+        try:
+            while await reader.read(1024):
+                pass
+        except Exception:
+            pass
+        if job.state not in ("done", "failed", "cancelled"):
+            self.cancel(job.id)
+
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        watcher: asyncio.Task | None = None
         try:
             line = await asyncio.wait_for(reader.readline(), timeout=30)
             request = json.loads(line or b"{}")
-            op = request.get("op", "status")
+            if not isinstance(request, dict):
+                raise ValueError("request must be a JSON object")
+            op = str(request.get("op", "status"))
+            self._log(writer, op, request)
             if op == "status":
-                await self._reply(writer, self.status())
+                await self._reply(writer, await self.status())
             elif op == "cancel":
                 await self._reply(writer, {"cancelled": self.cancel(str(request.get("id", "")))})
             elif op == "pause":
@@ -457,13 +583,20 @@ class Broker:
             elif op == "ping":
                 await self._reply(writer, {"pong": True})
             elif op == "submit":
+                self._check_request(request)
                 job = self.submit(
                     argv=request.get("argv"),
                     workload_name=request.get("workload"),
                     need_gb=request.get("need_gb"),
-                    priority=int(request.get("priority", 0)),
+                    priority=int(request.get("priority") or 0),
                     ttl=request.get("ttl"),
                     hold=bool(request.get("hold", False)),
+                )
+                # A lease is "hold the card while I am here": if the client goes away
+                # (Ctrl-C), release it. A queued `run` job belongs to the broker and
+                # keeps running; stop it with `gpupark cancel`.
+                watcher = (
+                    asyncio.create_task(self._watch_client(reader, job)) if job.hold else None
                 )
                 while True:
                     event = await job.events.get()
@@ -476,6 +609,8 @@ class Broker:
             with contextlib.suppress(Exception):
                 await self._reply(writer, {"error": str(exc)})
         finally:
+            if watcher is not None:
+                watcher.cancel()
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -487,12 +622,64 @@ class Broker:
         writer.write(data)
         await writer.drain()
 
+    @staticmethod
+    def _socket_is_live(sock: Path) -> bool:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(0.5)
+        try:
+            probe.connect(str(sock))
+        except OSError:
+            return False
+        finally:
+            probe.close()
+        return True
+
+    def _prepare_runtime_dir(self, sock: Path) -> None:
+        """Own the socket's directory: create it private, refuse one owned by somebody else."""
+        parent = sock.parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        st = os.lstat(parent)
+        if st.st_uid != os.getuid():
+            raise SystemExit(
+                f"{parent} is owned by uid {st.st_uid}, not this user; refusing to put a socket there"
+            )
+        if parent == Path(config_mod.runtime_dir()) and st.st_mode & 0o077:
+            os.chmod(parent, 0o700)  # the default runtime directory must be private
+        elif st.st_mode & 0o002:
+            print(f"gpupark: warning: {parent} is world-writable", flush=True)
+
+    def _claim_lock(self, sock: Path) -> None:
+        """One broker per socket path: hold an exclusive lock for the daemon's lifetime."""
+        path = sock.parent / "gpupark.lock"
+        self._lock_fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(self._lock_fd)
+            self._lock_fd = None
+            raise SystemExit(f"another gpupark broker holds {path}") from None
+
+    def _clear_stale_socket(self, sock: Path) -> None:
+        """Only a dead socket may go: never steal a live broker's socket, never delete a file."""
+        if not (sock.exists() or sock.is_symlink()):
+            return
+        mode = os.lstat(sock).st_mode
+        if not stat_mod.S_ISSOCK(mode):
+            raise SystemExit(f"{sock} exists and is not a socket; remove it or fix socket_path")
+        if self._socket_is_live(sock):
+            raise SystemExit(f"another broker is already listening on {sock}")
+        sock.unlink()
+
     async def serve(self) -> None:
         sock = Path(self.cfg.socket_path)
-        sock.parent.mkdir(parents=True, exist_ok=True)
-        if sock.exists():
-            sock.unlink()
-        self._server = await asyncio.start_unix_server(self.handle, path=str(sock))
+        self._prepare_runtime_dir(sock)
+        self._claim_lock(sock)
+        self._clear_stale_socket(sock)
+        old_umask = os.umask(0o077)  # bind private: no window at the umask default
+        try:
+            self._server = await asyncio.start_unix_server(self.handle, path=str(sock))
+        finally:
+            os.umask(old_umask)
         os.chmod(sock, 0o600)
         task = asyncio.create_task(self._scheduler())
         loop = asyncio.get_running_loop()
@@ -507,6 +694,10 @@ class Broker:
             if self._server:
                 self._server.close()
                 await self._server.wait_closed()
+            if self._lock_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(self._lock_fd)
+                self._lock_fd = None
 
     async def shutdown(self) -> None:
         """Stop scheduling and let `serve` return (SIGTERM/SIGINT land here)."""

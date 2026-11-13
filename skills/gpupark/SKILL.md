@@ -55,6 +55,19 @@ gpupark lease comfyui --for 1800          # hold a registered unit (e.g. a UI se
 - The command's stdout/stderr stream to you and its exit code becomes `gpupark`'s.
   A non-zero exit means the job failed, not that the broker did.
 
+## Pausing and resuming
+
+```bash
+gpupark pause        # give the card back; the lease stays yours
+gpupark resume
+```
+
+On a **unit** lease this stops the workload and restarts the baseline, so the
+resident model answers again while you keep your place. Paused time does not
+count against the TTL. On a **command** job `pause` only suspends the process —
+its VRAM stays allocated, so the baseline cannot come back; if you need the card
+instead of the CPU, `gpupark cancel` and resubmit.
+
 ## What happens to the machine
 
 1. The baseline is stopped (the LLM goes away — a chat request during your job

@@ -27,16 +27,29 @@ class Job:
     workload_name: str | None = None
     ttl: float | None = None
     hold: bool = False
-    state: str = "queued"  # queued|granted|running|done|failed|cancelled
+    state: str = "queued"  # queued|paused|granted|running|done|failed|cancelled
     exit_code: int | None = None
     error: str | None = None
     started_at: float | None = None
     ended_at: float | None = None
+    paused_since: float | None = None  # set while a running job is paused
+    paused_total: float = 0.0  # paused time that does not count against the TTL
+    pause_request: bool = False
+    suspended: bool = False  # command jobs: SIGSTOP sent
+    proc: Any = None  # asyncio.subprocess.Process for command jobs
     events: asyncio.Queue = field(default_factory=asyncio.Queue)
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
 
     def emit(self, event: str, **fields: Any) -> None:
         self.events.put_nowait({"ev": event, "id": self.id, **fields})
+
+    def active_seconds(self, now: float | None = None) -> float:
+        """Wall time this job has been running, excluding time spent paused."""
+        now = time.time() if now is None else now
+        paused = self.paused_total
+        if self.paused_since is not None:
+            paused += now - self.paused_since
+        return max(0.0, now - (self.started_at or now) - paused)
 
     def public(self) -> dict[str, Any]:
         return {
@@ -154,6 +167,47 @@ class Broker:
         self._wake.set()
         return True
 
+    def pause(self, job_id: str) -> dict[str, Any]:
+        """Give the card back without losing your place in the queue.
+
+        A queued job is held. A running systemd workload is stopped and the
+        baseline comes back; a running command is SIGSTOPped, which does not free
+        its VRAM (a suspended CUDA process keeps its allocations).
+        """
+        job = self.jobs.get(job_id)
+        if job is None:
+            return {"ok": False, "error": f"no such job {job_id!r}"}
+        if job.state == "queued":
+            job.state = "paused"
+            return {"ok": True, "state": "paused", "note": "held in the queue; not granted until resumed"}
+        if job.state in ("granted", "running") and not job.pause_request:
+            job.pause_request = True
+            job.paused_since = time.time()
+            note = (
+                "the process is suspended; its VRAM stays allocated, so the baseline cannot return"
+                if job.workload_name is None
+                else "stopping the workload and restoring the baseline"
+            )
+            job.emit("paused")
+            return {"ok": True, "state": job.state, "note": note}
+        return {"ok": False, "error": f"cannot pause a job that is {job.state}"}
+
+    def resume(self, job_id: str) -> dict[str, Any]:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return {"ok": False, "error": f"no such job {job_id!r}"}
+        if job.state == "paused":
+            job.state = "queued"
+            self._wake.set()
+            return {"ok": True, "state": "queued", "note": "back in the queue at the same priority"}
+        if job.pause_request and job.paused_since is not None:
+            job.pause_request = False
+            job.paused_total += time.time() - job.paused_since
+            job.paused_since = None
+            job.emit("resumed")
+            return {"ok": True, "state": job.state, "note": "resuming"}
+        return {"ok": False, "error": f"job {job_id} is not paused (state {job.state})"}
+
     def _next_job(self) -> Job | None:
         pending = [self.jobs[j] for j in self.order if self.jobs[j].state == "queued"]
         if not pending:
@@ -176,6 +230,10 @@ class Broker:
         return {
             "running": self.running.public() if self.running else None,
             "queue": [self.jobs[j].public() for j in self.order if self.jobs[j].state == "queued"],
+            "paused": [
+                self.jobs[j].public() for j in self.order if self.jobs[j].state == "paused"
+            ]
+            + ([self.running.public()] if self.running and self.running.pause_request else []),
             "baseline": {
                 "name": baseline.name if baseline else None,
                 "state": self.baseline_state,
@@ -285,14 +343,32 @@ class Broker:
             await asyncio.to_thread(self.host.start_unit, unit)
             if not await asyncio.to_thread(self.host.wait_active, unit, workload.ready_timeout):
                 raise RuntimeError(f"{unit} did not become active within {workload.ready_timeout:.0f}s")
-            deadline = time.monotonic() + job.ttl if job.ttl else None
             while True:
                 if job.cancel.is_set():
                     await asyncio.to_thread(self.host.stop_unit, unit)
                     raise asyncio.CancelledError()
+                if job.pause_request and not job.suspended:
+                    # give the card back: stop the workload, bring the baseline home
+                    await asyncio.to_thread(self.host.stop_unit, unit)
+                    await asyncio.to_thread(self.host.wait_inactive, unit, workload.stop_timeout)
+                    job.suspended = True
+                    await self._restore_baseline()
+                    continue
+                if not job.pause_request and job.suspended:
+                    await self._park_baseline()
+                    if not await self._wait_free(job.need_gb, timeout=self.cfg.grant_timeout):
+                        raise RuntimeError(f"the GPU did not come back for {job.need_gb:.1f} GB after resume")
+                    await asyncio.to_thread(self.host.start_unit, unit)
+                    await asyncio.to_thread(self.host.wait_active, unit, workload.ready_timeout)
+                    job.suspended = False
+                    continue
+                if job.suspended:
+                    # paused: a stopped unit is expected, not the job finishing
+                    await asyncio.sleep(0.5)
+                    continue
                 if not await asyncio.to_thread(self.host.is_active, unit):
                     return 0
-                if deadline and time.monotonic() >= deadline:
+                if job.ttl and job.active_seconds() >= job.ttl:
                     await asyncio.to_thread(self.host.stop_unit, unit)
                     return 0
                 await asyncio.sleep(1.0)
@@ -302,19 +378,48 @@ class Broker:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env={**os.environ, "GPUPARK_JOB_ID": job.id},
+            start_new_session=True,  # own process group, so pause reaches the whole tree
         )
+        job.proc = proc
 
         async def pump() -> None:
             assert proc.stdout is not None
             async for line in proc.stdout:
                 job.emit("output", line=line.decode(errors="replace").rstrip("\n"))
 
+        async def watch_pause() -> None:
+            """SIGSTOP/SIGCONT the job's process group. VRAM stays allocated."""
+            while proc.returncode is None:
+                try:
+                    if job.pause_request and not job.suspended:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGSTOP)
+                        job.suspended = True
+                    elif not job.pause_request and job.suspended:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGCONT)
+                        job.suspended = False
+                except ProcessLookupError:
+                    return
+                await asyncio.sleep(0.2)
+
+        async def watch_ttl() -> None:
+            ttl = job.ttl or 0.0
+            while proc.returncode is None and job.active_seconds() < ttl:
+                await asyncio.sleep(0.5)
+
         pump_task = asyncio.create_task(pump())
         wait_task = asyncio.create_task(proc.wait())
         cancel_task = asyncio.create_task(job.cancel.wait())
-        done, _ = await asyncio.wait(
-            {wait_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
-        )
+        pause_task = asyncio.create_task(watch_pause())
+        ttl_task = asyncio.create_task(watch_ttl()) if job.ttl else None
+        waiting = {wait_task, cancel_task} | ({ttl_task} if ttl_task else set())
+        done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+        pause_task.cancel()
+        if ttl_task:
+            ttl_task.cancel()
+        if job.suspended:  # never leave a stopped process behind
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(proc.pid), signal.SIGCONT)
+            job.suspended = False
         if cancel_task in done and not wait_task.done():
             proc.terminate()
             try:
@@ -324,6 +429,13 @@ class Broker:
                 await proc.wait()
             await pump_task
             raise asyncio.CancelledError()
+        if ttl_task is not None and ttl_task in done and not wait_task.done():
+            # lease expired: stop the job the same way a unit workload is stopped
+            proc.terminate()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            await pump_task
+            return 0
         await pump_task
         return proc.returncode or 0
 
@@ -338,6 +450,10 @@ class Broker:
                 await self._reply(writer, self.status())
             elif op == "cancel":
                 await self._reply(writer, {"cancelled": self.cancel(str(request.get("id", "")))})
+            elif op == "pause":
+                await self._reply(writer, self.pause(str(request.get("id", ""))))
+            elif op == "resume":
+                await self._reply(writer, self.resume(str(request.get("id", ""))))
             elif op == "ping":
                 await self._reply(writer, {"pong": True})
             elif op == "submit":

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gpupark"
-version = "0.1.1"
+version = "0.2.0"
 description = "Lease one GPU to many workloads: queue jobs, evict the idle baseline, restore it when the card is free."
 readme = "README.md"
 license = { file = "LICENSE" }

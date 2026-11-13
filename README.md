@@ -43,6 +43,23 @@ macOS: there is no `nvidia-smi`, so set `gpu_probe: none` in the config — the
 queue still serialises jobs, it just cannot check VRAM. `gpupark daemon` runs in
 the foreground (systemd is Linux-only).
 
+## Commands
+
+```bash
+gpupark run --need 22 --ttl 1800 -- ./render.sh     # queue a command
+gpupark lease comfyui --for 3600                    # hold a registered unit
+gpupark pause                                       # give the card back, keep your place
+gpupark resume                                      # take it again
+gpupark status | queue | cancel <id> | workloads | doctor
+```
+
+`pause` on a running **unit** lease stops the workload and brings the baseline
+back (the resident LLM answers again) while the lease stays yours; `resume`
+parks the baseline and restarts the workload. Time spent paused does not count
+against the TTL. On a **command** job `pause` only SIGSTOPs the process — its
+VRAM stays allocated, so the baseline cannot return; use it to free the CPU, not
+the card.
+
 ## Workloads
 
 `~/.config/gpupark/workloads.yaml`:

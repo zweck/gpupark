@@ -181,6 +181,46 @@ def cancel(job_id: str) -> None:
         raise typer.Exit(0 if event.get("cancelled") else 1)
 
 
+def _current_job_id() -> str | None:
+    for snapshot in _call({"op": "status"}):
+        running = snapshot.get("running")
+        if running:
+            return running["id"]
+        paused = snapshot.get("paused") or []
+        if paused:
+            return paused[0]["id"]
+    return None
+
+
+@app.command()
+def pause(job_id: str = typer.Argument(None, help="job id (default: the current lease)")) -> None:
+    """Give the card back temporarily; keep your place in the queue.
+
+    A systemd workload is stopped so the baseline can run again. A command job is
+    suspended, which does NOT free its VRAM - only a workload that can be stopped
+    gives the card back.
+    """
+    target = job_id or _current_job_id()
+    if not target:
+        raise typer.Exit(_fail("nothing is running to pause"))
+    for reply in _call({"op": "pause", "id": target}):
+        if not reply.get("ok"):
+            raise typer.Exit(_fail(reply.get("error", "pause failed")))
+        typer.echo(f"paused {target} ({reply.get('state')}): {reply.get('note', '')}")
+
+
+@app.command()
+def resume(job_id: str = typer.Argument(None, help="job id (default: the paused lease)")) -> None:
+    """Undo a pause: re-grant the lease (or return the job to the queue)."""
+    target = job_id or _current_job_id()
+    if not target:
+        raise typer.Exit(_fail("no paused job to resume"))
+    for reply in _call({"op": "resume", "id": target}):
+        if not reply.get("ok"):
+            raise typer.Exit(_fail(reply.get("error", "resume failed")))
+        typer.echo(f"resumed {target} ({reply.get('state')}): {reply.get('note', '')}")
+
+
 # ----------------------------------------------------------------- config
 
 config_app = typer.Typer(help="Config file helpers.")
@@ -232,6 +272,9 @@ def status(as_json: bool = typer.Option(False, "--json")) -> None:
         for job in queue:
             what = job.get("workload") or " ".join(job.get("argv") or [])
             typer.echo(f"  {job['id']}  {what}  (need {job['need_gb']:.1f} GB)")
+        for job in snapshot.get("paused") or []:
+            what = job.get("workload") or " ".join(job.get("argv") or [])
+            typer.echo(f"  paused: {job['id']}  {what}  (need {job['need_gb']:.1f} GB) — 'gpupark resume'")
 
 
 @app.command()

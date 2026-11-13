@@ -54,7 +54,7 @@ gpupark run --need 22 --ttl 1800 -- ./render.sh     # queue a command
 gpupark lease comfyui --for 3600                    # hold a registered unit
 gpupark pause [ID]                                  # give the card back, keep your place
 gpupark resume [ID]                                 # take it again
-gpupark status | queue | cancel <id> | workloads | doctor
+gpupark status | cancel <id> | workloads | doctor
 ```
 
 ## Pausing
@@ -113,7 +113,6 @@ workload may set `baseline: true`; it is started at daemon boot and after every 
 | `gpupark run --need 22 -- CMD...` | queue an ad-hoc command, wait for the lease, run it |
 | `gpupark lease comfyui --for 1800` | start a registered unit and hold the card for N seconds |
 | `gpupark status` | lease, queue, VRAM, baseline state |
-| `gpupark queue` | pending jobs |
 | `gpupark cancel ID` | drop a queued job or stop a running one |
 | `gpupark pause [ID]` | hand the card back; keep the lease and the queue place |
 | `gpupark resume [ID]` | re-grant a paused lease, or requeue a paused job |

@@ -52,17 +52,31 @@ the foreground (systemd is Linux-only).
 ```bash
 gpupark run --need 22 --ttl 1800 -- ./render.sh     # queue a command
 gpupark lease comfyui --for 3600                    # hold a registered unit
-gpupark pause                                       # give the card back, keep your place
-gpupark resume                                      # take it again
+gpupark pause [ID]                                  # give the card back, keep your place
+gpupark resume [ID]                                 # take it again
 gpupark status | queue | cancel <id> | workloads | doctor
 ```
 
-`pause` on a running **unit** lease stops the workload and brings the baseline
-back (the resident LLM answers again) while the lease stays yours; `resume`
-parks the baseline and restarts the workload. Time spent paused does not count
-against the TTL. On a **command** job `pause` only SIGSTOPs the process — its
-VRAM stays allocated, so the baseline cannot return; use it to free the CPU, not
-the card.
+## Pausing
+
+`gpupark pause` hands the card back without giving up the lease; `gpupark resume`
+takes it again. Both act on the current lease by default and take a job id
+otherwise (`gpupark pause 3f2a`).
+
+- **A running unit lease** — the workload is stopped and the baseline restarted,
+  so the resident model answers again while the lease stays yours. `resume` parks
+  the baseline, waits for the VRAM to actually free, then starts the workload.
+- **A queued job** — `gpupark pause <id>` holds it out of the queue: it is not
+  granted until you resume it, and it keeps its priority and place in line. This
+  is how you keep a submission for later without parking the card behind it.
+- **A running command job** — the process group is SIGSTOPped. Suspending does
+  **not** free VRAM (a stopped CUDA process keeps its allocations), so the
+  baseline cannot come back: use it to give up the CPU, not the card. Pause the
+  job while it is still queued if the GPU is what you want back.
+
+Paused time does not count against `--ttl`: the deadline moves out by however
+long the job was paused. `gpupark status` lists paused jobs under the queue with
+the `resume` hint.
 
 ## Workloads
 
@@ -101,6 +115,8 @@ workload may set `baseline: true`; it is started at daemon boot and after every 
 | `gpupark status` | lease, queue, VRAM, baseline state |
 | `gpupark queue` | pending jobs |
 | `gpupark cancel ID` | drop a queued job or stop a running one |
+| `gpupark pause [ID]` | hand the card back; keep the lease and the queue place |
+| `gpupark resume [ID]` | re-grant a paused lease, or requeue a paused job |
 | `gpupark doctor` | check nvidia-smi, systemd, units, config |
 | `gpupark daemon` | run the broker in the foreground (what the unit runs) |
 
@@ -112,6 +128,9 @@ workload may set `baseline: true`; it is started at daemon boot and after every 
 - **Priority then FIFO.** Higher `priority` first, ties in submission order.
 - **The baseline is the only workload that may be preempted.** A running job is never
   evicted by a later arrival.
+- **The TTL is running time, not wall time.** A job past its `--ttl` is stopped the same
+  way `cancel` stops it (a unit is stopped, a command is terminated), and time spent
+  paused is subtracted before that deadline is checked.
 - **A dead client does not leak a lease.** The broker owns the process/unit; the lease
   ends when the job exits, its TTL expires, or `gpupark cancel` stops it.
 - **Crash recovery.** The queue is journaled to `$XDG_RUNTIME_DIR/gpupark/state.json`;
@@ -119,8 +138,9 @@ workload may set `baseline: true`; it is started at daemon boot and after every 
 
 ## Status
 
-Milestone 1 (this release): daemon, queue, baseline preemption/restore, CLI, systemd
-integration, tests with a fake GPU. Milestone 2: ComfyUI adapter (hold the lease until
-the prompt finishes), multi-GPU pools, `gpupark top`. Milestone 3: webhooks/metrics.
+Milestone 1 (this release): daemon, queue, baseline preemption/restore, pause/resume,
+CLI, systemd integration, tests with a fake GPU. Milestone 2: ComfyUI adapter (hold the
+lease until the prompt finishes), multi-GPU pools, `gpupark top`. Milestone 3:
+webhooks/metrics.
 
 Apache-2.0.

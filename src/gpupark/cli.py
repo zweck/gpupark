@@ -18,6 +18,23 @@ from . import config as config_mod
 app = typer.Typer(no_args_is_help=True, add_completion=False, help="Lease one GPU to many workloads.")
 
 
+def _show_version(value: bool) -> None:
+    if value:
+        from . import __version__
+
+        typer.echo(f"gpupark {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _root(
+    version: bool = typer.Option(
+        False, "--version", callback=_show_version, is_eager=True, help="Print the version and exit."
+    ),
+) -> None:
+    """Lease one GPU to many workloads."""
+
+
 # ------------------------------------------------------------------ client
 
 def _socket_path() -> Path:
@@ -69,7 +86,14 @@ def daemon() -> None:
 
 @app.command()
 def install_service(force: bool = typer.Option(False, "--force")) -> None:
-    """Install and start a systemd --user unit for the daemon."""
+    """Install and start a systemd --user unit for the daemon (Linux)."""
+    if sys.platform == "darwin":
+        raise typer.Exit(
+            _fail(
+                "systemd is Linux-only; on macOS run 'gpupark daemon' in the foreground, "
+                "or wrap it in a launchd plist"
+            )
+        )
     unit_dir = Path("~/.config/systemd/user").expanduser()
     unit_dir.mkdir(parents=True, exist_ok=True)
     unit = unit_dir / "gpupark.service"
@@ -157,6 +181,27 @@ def cancel(job_id: str) -> None:
         raise typer.Exit(0 if event.get("cancelled") else 1)
 
 
+# ----------------------------------------------------------------- config
+
+config_app = typer.Typer(help="Config file helpers.")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("init")
+def config_init(
+    force: bool = typer.Option(False, "--force", help="overwrite an existing file"),
+    path: str | None = typer.Option(None, "--path", help="write somewhere other than the default"),
+) -> None:
+    """Write a starter workloads.yaml."""
+    target = Path(path).expanduser() if path else config_mod.default_config_path()
+    if target.exists() and not force:
+        raise typer.Exit(_fail(f"{target} already exists (--force to overwrite)"))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(config_mod.EXAMPLE_YAML)
+    typer.echo(f"wrote {target}")
+    typer.echo("edit it, then: gpupark doctor && gpupark install-service")
+
+
 # ------------------------------------------------------------------ views
 
 @app.command()
@@ -209,12 +254,20 @@ def doctor() -> None:
     """Check the things a lease depends on."""
     problems = 0
     cfg_path = config_mod.default_config_path()
+    probe = "auto"
     if Path(cfg_path).exists():
         typer.echo(f"ok    config {cfg_path}")
+        try:
+            probe = config_mod.load().gpu_probe
+        except Exception as exc:
+            problems += 1
+            typer.echo(f"FAIL  config unreadable: {exc}")
     else:
         problems += 1
-        typer.echo(f"FAIL  config missing: {cfg_path} (copy workloads.example.yaml)")
-    if shutil.which("nvidia-smi"):
+        typer.echo(f"FAIL  config missing: {cfg_path} (run 'gpupark config init')")
+    if probe == "none":
+        typer.echo("ok    gpu probe disabled (gpu_probe: none) — the queue alone serialises work")
+    elif shutil.which("nvidia-smi"):
         try:
             from . import gpu
 

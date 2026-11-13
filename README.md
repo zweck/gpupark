@@ -21,11 +21,27 @@ job exited 0; restoring baseline tensorfold in 5s
 
 ## Install
 
-```bash
-pipx install gpupark        # or: uv tool install gpupark
-gpupark install-service     # systemd --user unit for the daemon
-gpupark doctor
+**One line, Linux and macOS** — installs into `~/.local/share/gpupark`, links
+`~/.local/bin/gpupark`, no sudo, nothing added to your system Python:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zweck/gpupark/main/install.sh | sh
 ```
+
+Then:
+
+```sh
+gpupark config init         # write ~/.config/gpupark/workloads.yaml
+gpupark doctor              # check nvidia-smi, systemd, the daemon
+gpupark install-service     # Linux: run the broker as a systemd --user unit
+```
+
+Uninstall with `curl -fsSL .../install.sh | sh -s -- --uninstall`. If you already
+have pipx or uv, `pipx install gpupark` / `uv tool install gpupark` work too.
+
+macOS: there is no `nvidia-smi`, so set `gpu_probe: none` in the config — the
+queue still serialises jobs, it just cannot check VRAM. `gpupark daemon` runs in
+the foreground (systemd is Linux-only).
 
 ## Workloads
 

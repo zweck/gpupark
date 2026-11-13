@@ -54,10 +54,19 @@ class Job:
         }
 
 
+class NoProbe(RuntimeError):
+    """gpu_probe is "none": this box has no nvidia-smi to ask."""
+
+
 class Host:
     """Every side effect the broker performs, in one place (fakeable in tests)."""
 
+    def __init__(self, probe: str = "auto") -> None:
+        self.probe = probe
+
     def gpu_memory(self, index: int) -> tuple[int, int]:
+        if self.probe == "none":
+            raise NoProbe("gpu probe disabled (gpu_probe: none)")
         return gpu.memory(index)
 
     def is_active(self, unit: str) -> bool:
@@ -79,7 +88,7 @@ class Host:
 class Broker:
     def __init__(self, cfg: config_mod.Config, host: Host | None = None) -> None:
         self.cfg = cfg
-        self.host = host or Host()
+        self.host = host or Host(cfg.gpu_probe)
         self.jobs: dict[str, Job] = {}
         self.order: list[str] = []
         self.running: Job | None = None
@@ -216,6 +225,8 @@ class Broker:
         self.baseline_state = "parked"
 
     async def _wait_free(self, need_gb: float, timeout: float) -> bool:
+        if self.cfg.gpu_probe == "none":
+            return True  # nothing to measure; the queue alone serialises work
         need_mib = int(need_gb * 1024)
 
         def check() -> bool:

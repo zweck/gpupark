@@ -36,6 +36,30 @@ def default_state_path() -> Path:
     return runtime_dir() / "gpupark" / "state.json"
 
 
+EXAMPLE_YAML = """\
+# gpupark workloads
+gpu: 0
+# gpu_probe: auto        # "none" queues without checking VRAM (no NVIDIA GPU)
+poll_seconds: 0.5
+cooldown_seconds: 8
+grant_timeout: 120
+
+workloads:
+  # the resident model: holds the card whenever nothing else needs it
+  # llm:
+  #   kind: unit
+  #   target: my-llm.service
+  #   vram_gb: 21
+  #   baseline: true
+  #   priority: -10
+  #
+  # comfyui:
+  #   kind: unit
+  #   target: comfyui.service
+  #   vram_gb: 22
+"""
+
+
 @dataclass
 class Workload:
     """Something that can hold the GPU: a systemd --user unit or a command."""
@@ -66,6 +90,7 @@ class Workload:
 @dataclass
 class Config:
     gpu: int = 0
+    gpu_probe: str = "auto"  # "auto" | "none" (no nvidia-smi: queue without VRAM gating)
     poll_seconds: float = 0.5
     cooldown_seconds: float = 5.0
     grant_timeout: float = 120.0
@@ -91,6 +116,7 @@ class Config:
 def parse(raw: dict[str, Any]) -> Config:
     cfg = Config(
         gpu=int(raw.get("gpu", 0)),
+        gpu_probe=str(raw.get("gpu_probe", "auto")),
         poll_seconds=float(raw.get("poll_seconds", 0.5)),
         cooldown_seconds=float(raw.get("cooldown_seconds", 5.0)),
         grant_timeout=float(raw.get("grant_timeout", 120.0)),
@@ -112,6 +138,8 @@ def parse(raw: dict[str, Any]) -> Config:
         workload.check()
         cfg.workloads[name] = workload
     cfg.baseline()  # validates uniqueness
+    if cfg.gpu_probe not in ("auto", "none"):
+        raise ValueError(f"gpu_probe must be 'auto' or 'none', not {cfg.gpu_probe!r}")
     return cfg
 
 

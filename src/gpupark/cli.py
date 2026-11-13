@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import socket
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator, List, Optional
 
 import typer
 
@@ -21,10 +22,8 @@ app = typer.Typer(no_args_is_help=True, add_completion=False, help="Lease one GP
 
 def _socket_path() -> Path:
     override = None
-    try:
+    with contextlib.suppress(Exception):
         override = config_mod.load().socket_path
-    except Exception:
-        pass
     return Path(override) if override else config_mod.default_socket_path()
 
 
@@ -33,7 +32,9 @@ def _call(payload: dict, stream: bool = False) -> Iterator[dict]:
     try:
         sock.connect(str(_socket_path()))
     except (FileNotFoundError, ConnectionRefusedError) as exc:
-        raise typer.Exit(_fail(f"cannot reach the gpupark daemon ({exc}); run 'gpupark daemon' or start gpupark.service"))
+        raise typer.Exit(
+            _fail(f"cannot reach the gpupark daemon ({exc}); start gpupark.service or 'gpupark daemon'")
+        ) from None
     with sock.makefile("rwb") as handle:
         handle.write((json.dumps(payload) + "\n").encode())
         handle.flush()
@@ -62,10 +63,8 @@ def daemon() -> None:
 
     cfg = config_mod.load()
     broker = Broker(cfg)
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(broker.serve())
-    except KeyboardInterrupt:
-        pass
 
 
 @app.command()
@@ -100,11 +99,11 @@ def run(
     ctx: typer.Context,
     need: float = typer.Option(0.0, "--need", help="VRAM the job needs, in GB"),
     priority: int = typer.Option(0, "--priority", help="higher runs first"),
-    ttl: Optional[float] = typer.Option(None, "--ttl", help="lease time limit, seconds"),
+    ttl: float | None = typer.Option(None, "--ttl", help="lease time limit, seconds"),
     quiet: bool = typer.Option(False, "--quiet", help="only stream the job's own output"),
 ) -> None:
     """Queue a command; it runs when the GPU is free."""
-    argv: List[str] = [a for a in ctx.args if a != "--"]
+    argv: list[str] = [a for a in ctx.args if a != "--"]
     if not argv:
         raise typer.BadParameter("give a command after '--'")
     code = 0
@@ -135,7 +134,7 @@ def run(
 @app.command()
 def lease(
     workload: str = typer.Argument(..., help="a workload name from workloads.yaml"),
-    ttl: Optional[float] = typer.Option(None, "--for", help="hold for N seconds, then release"),
+    ttl: float | None = typer.Option(None, "--for", help="hold for N seconds, then release"),
 ) -> None:
     """Start a registered workload and hold the GPU until this command is interrupted."""
     for event in _call({"op": "submit", "workload": workload, "ttl": ttl, "hold": True}, stream=True):
@@ -228,7 +227,9 @@ def doctor() -> None:
         problems += 1
         typer.echo("FAIL  nvidia-smi not on PATH")
     if shutil.which("systemctl"):
-        result = subprocess.run(["systemctl", "--user", "is-system-running"], capture_output=True, text=True)
+        result = subprocess.run(
+            ["systemctl", "--user", "is-system-running"], capture_output=True, text=True, check=False
+        )
         state = (result.stdout or result.stderr).strip() or "unknown"
         typer.echo(f"ok    systemd --user: {state}")
     else:

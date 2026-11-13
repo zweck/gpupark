@@ -40,3 +40,9 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 110
+
+[tool.ruff.lint]
+# Explicit so CI and a developer's machine agree. Broad catches around leases
+# (BLE001/S110) are deliberate in a supervisor and stay out of the selection.
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "PLW"]
+ignore = ["B008"]  # typer's Option() defaults are the documented idiom

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -181,10 +182,8 @@ class Broker:
             job = self._next_job()
             if job is None:
                 self._wake.clear()
-                try:
+                with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self._wake.wait(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    pass
                 continue
             await self._run(job)
 
@@ -263,10 +262,8 @@ class Broker:
             else:
                 job.emit("cancelled")
             if workload is not None and workload.kind == "unit" and not job.hold:
-                try:
+                with contextlib.suppress(Exception):
                     await asyncio.to_thread(self.host.stop_unit, str(workload.target))
-                except Exception:
-                    pass
             await asyncio.sleep(self.cfg.cooldown_seconds)
             if self._next_job() is None:
                 await self._restore_baseline()
@@ -349,10 +346,8 @@ class Broker:
             else:
                 await self._reply(writer, {"error": f"unknown op {op!r}"})
         except Exception as exc:
-            try:
+            with contextlib.suppress(Exception):
                 await self._reply(writer, {"error": str(exc)})
-            except Exception:
-                pass
         finally:
             try:
                 writer.close()
@@ -375,10 +370,8 @@ class Broker:
         task = asyncio.create_task(self._scheduler())
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
+            with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, lambda: asyncio.ensure_future(self.shutdown()))
-            except NotImplementedError:
-                pass
         print(f"gpupark listening on {sock}", flush=True)
         try:
             await self._exit.wait()

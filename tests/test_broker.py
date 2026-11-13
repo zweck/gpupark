@@ -84,8 +84,6 @@ def test_a_job_that_never_fits_fails_with_a_useful_message():
             "base": {"kind": "unit", "target": "base.service", "vram_gb": 20, "baseline": True},
         }
     )
-    host = FakeHost(total_mib=24576, baseline_mib=20000)
-
     async def scenario():
         job = broker.submit(argv=["true"], need_gb=40)
         await broker._run(job)

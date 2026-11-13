@@ -17,6 +17,7 @@ def _systemctl(*args: str, timeout: float = 30) -> subprocess.CompletedProcess:
             capture_output=True,
             text=True,
             timeout=timeout,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SystemdError(f"systemctl --user {' '.join(args)} failed: {exc}") from exc

@@ -97,8 +97,8 @@ def parse(raw: dict[str, Any]) -> Config:
         socket_path=str(raw.get("socket_path") or default_socket_path()),
         state_path=str(raw.get("state_path") or default_state_path()),
     )
-    for name, entry in (raw.get("workloads") or {}).items():
-        entry = dict(entry or {})
+    for name, raw_entry in (raw.get("workloads") or {}).items():
+        entry = dict(raw_entry or {})
         workload = Workload(
             name=name,
             kind=str(entry.get("kind", "unit")),
@@ -122,5 +122,5 @@ def load(path: Path | str | None = None) -> Config:
     with path.open() as handle:
         raw = yaml.safe_load(handle) or {}
     if not isinstance(raw, dict):
-        raise ValueError(f"{path}: expected a mapping at the top level")
+        raise TypeError(f"{path}: expected a mapping at the top level")
     return parse(raw)

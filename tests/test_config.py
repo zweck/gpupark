@@ -2,7 +2,6 @@ import pytest
 
 from gpupark import config
 
-
 RAW = {
     "gpu": 0,
     "cooldown_seconds": 2,

@@ -1,9 +1,25 @@
 ---
 name: gpupark
-description: Use when a GPU job must queue for, or preempt, a resident model or render on one card.
+description: Use when GPU work must queue or preempt a resident model.
+version: 1.0.0
+author: Phil Hauser
+license: Apache-2.0
+metadata:
+  hermes:
+    tags: [gpu, queue, scheduler, vram, llm, comfyui]
+    related_skills: []
 ---
 
 # Using gpupark
+
+## When to Use
+
+- a render, training run, video generation or game build needs the whole GPU;
+- a resident model (the baseline) is holding the card and must yield;
+- several agents share one machine and their GPU work must serialise;
+- you want a deterministic "granted" moment instead of polling `nvidia-smi`.
+
+Do not use it for CPU-only work, and never share one lease between two processes.
 
 `gpupark` is the lease broker for a single GPU. It owns one exclusive lease, a
 priority queue, and a **baseline** workload (usually the resident LLM) that holds

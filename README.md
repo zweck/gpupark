@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/zweck/gpupark/main/assets/gpupark-logo.jpg" width="480" alt="gpupark">
+</p>
+
 # gpupark
 
 **One GPU. Many tenants. Lease it, and park what's idle.**

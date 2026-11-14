@@ -467,10 +467,8 @@ class Broker:
             await asyncio.sleep(self.cfg.poll_seconds)
 
     async def _run(self, job: Job) -> None:
-        job.state = "granted"
         job.started_at = time.time()
         self.running = job
-        job.emit("granted")
         workload = self.cfg.workload(job.workload_name) if job.workload_name else None
         watcher: asyncio.Task | None = None
         try:
@@ -484,6 +482,10 @@ class Broker:
                         f"the GPU never freed {job.need_gb:.1f} GB (still in use by something "
                         f"gpupark does not manage?){hint}"
                     )
+            # announce the lease only once the card can actually satisfy it: 'granted' followed
+            # by an admission refusal reads as a broker that handed out something it did not have
+            job.state = "granted"
+            job.emit("granted")
             job.state = "running"
             job.emit("running")
             watcher = asyncio.create_task(self._watch_foreign(job))

@@ -141,6 +141,13 @@ def run(
             typer.echo(f"queued {event['id']} (need {need:.1f} GB, priority {priority})", err=True)
         elif kind == "granted" and not quiet:
             typer.echo("granted", err=True)
+        elif kind == "foreign" and not quiet:
+            who = ", ".join(
+                f"pid {p['pid']} {p['name']} {p['used_mib'] / 1024:.1f} GB"
+                for p in event.get("processes", [])
+            )
+            label = "refusing to grant" if event.get("blocked") else "warning"
+            typer.echo(f"{label}: foreign GPU use — {who}", err=True)
         elif kind in ("done", "failed"):
             code = int(event.get("exit_code") or 0)
             if kind == "failed" and event.get("error"):
@@ -267,6 +274,12 @@ def status(as_json: bool = typer.Option(False, "--json")) -> None:
             typer.echo(f"lease: {running['id']} {what} (need {running['need_gb']:.1f} GB)")
         else:
             typer.echo("lease: free")
+        foreign = snapshot.get("foreign") or []
+        if foreign:
+            who = ", ".join(
+                f"pid {p['pid']} {p['name']} {p['used_mib'] / 1024:.1f} GB" for p in foreign
+            )
+            typer.echo(f"foreign: {who}")
         queue = snapshot.get("queue") or []
         typer.echo(f"queue: {len(queue)}")
         for job in queue:

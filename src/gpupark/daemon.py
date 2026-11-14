@@ -110,6 +110,19 @@ class Host:
     def wait_inactive(self, unit: str, timeout: float) -> bool:
         return systemd.wait_inactive(unit, timeout)
 
+    def gpu_processes(self) -> list[gpu.Proc]:
+        if self.probe == "none":
+            return []
+        return gpu.processes()
+
+    def unit_pids(self, unit: str) -> set[int]:
+        """Live PIDs belonging to a unit (its MainPID subtree), for attributing GPU memory."""
+        pid = systemd.main_pid(unit)
+        return gpu.process_tree(pid) if pid else set()
+
+    def signal_pid(self, pid: int, sig: int) -> None:
+        os.kill(pid, sig)
+
 
 class Broker:
     def __init__(self, cfg: config_mod.Config, host: Host | None = None) -> None:
@@ -249,9 +262,16 @@ class Broker:
             }
         except Exception as exc:  # nvidia-smi may be missing on a test box
             gpu_view = {"index": self.cfg.gpu, "error": str(exc)}
+        try:
+            foreign_view = [
+                proc.public() for proc in await asyncio.to_thread(self._foreign_procs, self.running)
+            ]
+        except Exception:
+            foreign_view = []
         baseline = self.cfg.baseline()
         return {
             "running": self.running.public() if self.running else None,
+            "foreign": foreign_view,
             "queue": [self.jobs[j].public() for j in self.order if self.jobs[j].state == "queued"],
             "paused": [
                 self.jobs[j].public() for j in self.order if self.jobs[j].state == "paused"
@@ -331,6 +351,104 @@ class Broker:
             return
         self.baseline_state = "parked"
 
+    # ------------------------------------------------------- lease integrity
+
+    def _lease_pids(self, job: Job | None) -> set[int]:
+        """PIDs that may legitimately hold VRAM under this lease."""
+        known: set[int] = set()
+        if job is not None:
+            for holder in (getattr(job.proc, "pid", None), job.pgid):
+                if holder:
+                    known |= gpu.process_tree(int(holder))
+        for workload in self.cfg.workloads.values():
+            if workload.kind == "unit":
+                with contextlib.suppress(Exception):
+                    known |= self.host.unit_pids(str(workload.target))
+        return known
+
+    def _foreign_procs(self, job: Job | None = None) -> list[gpu.Proc]:
+        """GPU processes belonging neither to this lease nor to a registered unit.
+
+        A failed probe returns [] ("unknown"), never a claim that nothing is there.
+        """
+        if self.cfg.gpu_probe == "none":
+            return []
+        try:
+            procs = self.host.gpu_processes()
+        except Exception:
+            return []
+        known = self._lease_pids(job)
+        return [
+            proc
+            for proc in procs
+            if proc.pid not in known and proc.used_mib >= self.cfg.foreign_tolerance_mib
+        ]
+
+    @staticmethod
+    def _describe(procs: list[gpu.Proc]) -> str:
+        return ", ".join(f"pid {p.pid} {p.name} ({p.used_mib / 1024:.1f} GB)" for p in procs)
+
+    def _apply_foreign_policy(self, fresh: list[gpu.Proc]) -> None:
+        """Police intruders that appeared after the grant (never pre-existing ones)."""
+        if self.cfg.foreign_policy not in ("stop", "kill") or not fresh:
+            return
+        sig = signal.SIGSTOP if self.cfg.foreign_policy == "stop" else signal.SIGKILL
+        for proc in fresh:
+            with contextlib.suppress(OSError):
+                self.host.signal_pid(proc.pid, sig)
+
+    async def _admission(self, job: Job) -> None:
+        """Refuse a lease the card cannot satisfy, naming what is in the way.
+
+        Runs after the baseline is parked, when every remaining megabyte belongs to a process
+        gpupark does not manage. A job that starts anyway dies mid-sampler with a CUDA allocation
+        error (`Fault failed: 2`) that reads like a broken graph.
+        """
+        if self.cfg.gpu_probe == "none" or job.need_gb <= 0:
+            return
+        foreign = await asyncio.to_thread(self._foreign_procs, job)
+        if not foreign:
+            return
+        payload = [proc.public() for proc in foreign]
+        total, used = await asyncio.to_thread(self.host.gpu_memory, self.cfg.gpu)
+        free_mib = max(0, total - used)
+        if free_mib >= int(job.need_gb * 1024):
+            job.emit("foreign", processes=payload, blocked=False)
+            print(f"gpupark: foreign GPU use tolerated — {self._describe(foreign)}", flush=True)
+            return
+        job.emit("foreign", processes=payload, blocked=True)
+        raise RuntimeError(
+            f"refusing to grant: {free_mib / 1024:.1f} GB free, {job.need_gb:.1f} GB requested, and "
+            f"{self._describe(foreign)} is held by processes gpupark does not manage "
+            f"(foreign_policy={self.cfg.foreign_policy}). Stop them and resubmit."
+        )
+
+    async def _watch_foreign(self, job: Job) -> None:
+        """During a lease: notice VRAM taken by processes that are not ours, and police it.
+
+        PIDs already present when the lease started are recorded first, so `stop`/`kill` can only
+        ever reach something that arrived after the grant.
+        """
+        if self.cfg.gpu_probe == "none":
+            return
+        seen = {proc.pid for proc in await asyncio.to_thread(self._foreign_procs, job)}
+        while self.running is job:
+            await asyncio.sleep(self.cfg.foreign_poll_seconds)
+            if self.running is not job:
+                return
+            foreign = await asyncio.to_thread(self._foreign_procs, job)
+            fresh = [proc for proc in foreign if proc.pid not in seen]
+            if not fresh:
+                continue
+            seen |= {proc.pid for proc in fresh}
+            job.emit("foreign", processes=[proc.public() for proc in fresh], blocked=False)
+            print(
+                f"gpupark: {self._describe(fresh)} took VRAM during lease {job.id} "
+                f"(foreign_policy={self.cfg.foreign_policy})",
+                flush=True,
+            )
+            self._apply_foreign_policy(fresh)
+
     async def _wait_free(self, need_gb: float, timeout: float) -> bool:
         if self.cfg.gpu_probe == "none":
             return True  # nothing to measure; the queue alone serialises work
@@ -354,16 +472,21 @@ class Broker:
         self.running = job
         job.emit("granted")
         workload = self.cfg.workload(job.workload_name) if job.workload_name else None
+        watcher: asyncio.Task | None = None
         try:
             if job.need_gb > 0:
                 await self._park_baseline()
+                await self._admission(job)
                 if not await self._wait_free(job.need_gb, timeout=job.ttl or self.cfg.grant_timeout):
+                    foreign = await asyncio.to_thread(self._foreign_procs, job)
+                    hint = f" — held by {self._describe(foreign)}" if foreign else ""
                     raise RuntimeError(
                         f"the GPU never freed {job.need_gb:.1f} GB (still in use by something "
-                        f"gpupark does not manage?)"
+                        f"gpupark does not manage?){hint}"
                     )
             job.state = "running"
             job.emit("running")
+            watcher = asyncio.create_task(self._watch_foreign(job))
             code = await self._execute(job, workload)
             job.exit_code = code
             job.state = "done" if code == 0 else "failed"
@@ -373,6 +496,10 @@ class Broker:
             job.state = "failed"
             job.error = str(exc)
         finally:
+            if watcher is not None:
+                watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await watcher
             job.ended_at = time.time()
             self.running = None
             if job.state in ("done", "failed"):

@@ -143,6 +143,35 @@ workload may set `baseline: true`; it is started at daemon boot and after every 
   next start removes it). Restart the broker and check `gpupark status` for leftovers;
   journaling is not implemented yet.
 
+## Lease integrity
+
+A lease is only worth what the card actually does. gpupark watches for VRAM taken by processes it
+does not manage — a game, a stray script, a second UI. Those are invisible to the queue, and they
+turn a healthy render into a mid-sampler allocation failure (`CUDA error 2`, which ComfyUI surfaces
+as `Fault failed: 2` and reads like a broken graph).
+
+Two hooks, both fed by `nvidia-smi --query-compute-apps`:
+
+- **Admission.** After the baseline is parked, a job that cannot fit because something else holds
+  memory is refused *before* it starts, with the offending processes named:
+  `refusing to grant: 3.8 GB free, 22.0 GB requested, and pid 3486725 ApexGP.x86_64 (3.4 GB) is held by processes gpupark does not manage`.
+- **Watch.** During a lease, a poll notices new allocations and reports them:
+  `gpupark: pid 3486725 ApexGP.x86_64 (3.4 GB) took VRAM during lease <id> (foreign_policy=warn)`.
+
+```yaml
+foreign_policy: warn        # warn (default) | stop (SIGSTOP) | kill (SIGKILL)
+foreign_poll_seconds: 5
+foreign_tolerance_mib: 512  # ignore allocator dust
+```
+
+`stop` and `kill` only ever reach a pid that appeared *after* the grant; anything already resident
+is named and left alone. The job's own process tree and the MainPID subtree of every registered
+unit are never treated as foreign. `gpupark status` lists foreign usage as well.
+
+This is accounting, not enforcement: no user-space broker can stop a Vulkan game from allocating
+memory. Driver-level exclusivity (`nvidia-smi -c EXCLUSIVE_PROCESS`) covers CUDA contexts only and
+needs root, so it is not something gpupark flips on your behalf.
+
 ## Security model
 
 - **The socket is the whole boundary.** `$XDG_RUNTIME_DIR/gpupark.sock`, mode `0600`, inside a

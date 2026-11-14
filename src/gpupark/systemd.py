@@ -44,6 +44,15 @@ def stop(unit: str) -> None:
         raise SystemdError(f"could not stop {unit}: {message}")
 
 
+def main_pid(unit: str) -> int:
+    """The unit's MainPID, or 0 when it is not running. Used to attribute GPU memory."""
+    result = _systemctl("show", "-p", "MainPID", "--value", "--", unit, timeout=10)
+    try:
+        return int(result.stdout.strip() or 0)
+    except ValueError:
+        return 0
+
+
 def wait_active(unit: str, timeout: float, interval: float = 0.5) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

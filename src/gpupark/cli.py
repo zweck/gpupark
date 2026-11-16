@@ -127,7 +127,11 @@ def run(
     quiet: bool = typer.Option(False, "--quiet", help="only stream the job's own output"),
 ) -> None:
     """Queue a command; it runs when the GPU is free."""
-    argv: list[str] = [a for a in ctx.args if a != "--"]
+    # Only the separator belongs to gpupark: everything after the first '--' is the job's own argv, and a
+    # job may use '--' itself (Godot's editor bake: `godot --editor -- --lm-bake=x`).
+    argv: list[str] = list(ctx.args)
+    if argv and argv[0] == "--":
+        argv = argv[1:]
     if not argv:
         raise typer.BadParameter("give a command after '--'")
     code = 0

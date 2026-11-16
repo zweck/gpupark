@@ -565,8 +565,33 @@ class Broker:
 
         async def pump() -> None:
             assert proc.stdout is not None
-            async for line in proc.stdout:
-                job.emit("output", line=line.decode(errors="replace").rstrip("\n"))
+            # Never iterate lines here: one over-long line (a probe dumping a 250 KB JSON row, a progress
+            # bar without a newline) overruns the stream limit and kills the job with "Separator is found,
+            # but chunk is longer than limit". Read fixed chunks, split them here, and emit an over-long
+            # line as several pieces so the caller still receives all of it.
+            buf = b""
+            piece = 64 * 1024
+            while True:
+                chunk = await proc.stdout.read(piece)
+                if not chunk:
+                    break
+                buf += chunk
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl >= 0:
+                        job.emit("output", line=buf[:nl].decode(errors="replace"))
+                        buf = buf[nl + 1:]
+                        continue
+                    if len(buf) >= piece:
+                        job.emit("output", line=buf[:piece].decode(errors="replace"))
+                        buf = buf[piece:]
+                        continue
+                    break
+            while len(buf) >= piece:
+                job.emit("output", line=buf[:piece].decode(errors="replace"))
+                buf = buf[piece:]
+            if buf:
+                job.emit("output", line=buf.decode(errors="replace"))
 
         async def watch_pause() -> None:
             """SIGSTOP/SIGCONT the job's process group. VRAM stays allocated."""

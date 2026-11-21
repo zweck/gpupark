@@ -229,6 +229,14 @@ def run(
     argv = _raw[_raw.index("--") + 1:]
     if not argv:
         raise typer.BadParameter("give a command after '--'")
+    # `run` takes no positional arguments of its own, so Click's leftover args must be exactly the
+    # job command. When they differ, the `--` we split on was the JOB's own separator and the command
+    # would be silently truncated — refuse it instead.
+    if [token for token in argv if token != "--"] != list(ctx.args):
+        raise typer.BadParameter(
+            "gpupark run takes no positional arguments before '--': put the whole job command "
+            "after it (gpupark run --need 8 -- my-job --flag)"
+        )
     try:
         from click.core import ParameterSource
 

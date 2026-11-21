@@ -182,7 +182,7 @@ class Host:
 class Broker:
     def __init__(self, cfg: config_mod.Config, host: Host | None = None) -> None:
         self.cfg = cfg
-        self.host = host or Host(cfg.gpu_probe)
+        self.host = host or Host(cfg.gpu_probe, cfg.gpu)
         self.jobs: dict[str, Job] = {}
         self.order: list[str] = []
         self.recent: list[dict[str, Any]] = []  # bounded history of finished jobs
@@ -227,16 +227,23 @@ class Broker:
         )
         self.jobs[job.id] = job
         self.order.append(job.id)
-        job.emit("queued", position=self._position(job))
+        job.emit(
+            "queued",
+            position=self._position(job),
+            need_gb=job.need_gb,
+            priority=job.priority,
+        )
         self._wake.set()
         return job
 
     def _position(self, job: Job) -> int:
-        pending = [j for j in self.order if self.jobs[j].state == "queued"]
-        try:
-            return pending.index(job.id) + 1
-        except ValueError:
-            return 0
+        """Where `job` sits in the run order (priority first, then submission time)."""
+        pending = [self.jobs[j] for j in self.order if self.jobs[j].state == "queued"]
+        pending.sort(key=lambda item: (-item.priority, item.submitted_at))
+        for index, item in enumerate(pending):
+            if item.id == job.id:
+                return index + 1
+        return 0
 
     LIVE_STATES = ("queued", "admitting", "granted", "running", "paused")
 
@@ -255,6 +262,13 @@ class Broker:
         """The single live job whose id matches `token`, or None when missing or ambiguous."""
         matches = self._matches(token)
         return matches[0] if len(matches) == 1 else None
+
+    def _missing_job_error(self, token: str) -> str:
+        """One message for 'nothing live matches' and for 'your prefix is ambiguous'."""
+        matches = self._matches(token)
+        if not matches:
+            return f"no live job matching {token!r}"
+        return f"{token!r} matches {len(matches)} live jobs: {', '.join(matches)}"
 
     def cancel(self, job_id: str) -> bool:
         token = self.resolve(job_id)
@@ -280,7 +294,7 @@ class Broker:
         """
         job = self.jobs.get(self.resolve(job_id) or "") or None
         if job is None:
-            return {"ok": False, "error": f"no live job matching {job_id!r}"}
+            return {"ok": False, "error": self._missing_job_error(job_id)}
         if job.state == "admitting":
             return {
                 "ok": False,
@@ -304,7 +318,7 @@ class Broker:
     def resume(self, job_id: str) -> dict[str, Any]:
         job = self.jobs.get(self.resolve(job_id) or "") or None
         if job is None:
-            return {"ok": False, "error": f"no live job matching {job_id!r}"}
+            return {"ok": False, "error": self._missing_job_error(job_id)}
         if job.state == "paused":
             job.state = "queued"
             self._wake.set()
@@ -620,15 +634,22 @@ class Broker:
         """
         if self.cfg.gpu_probe == "none":
             return
-        seen = {
-            proc.pid for proc in (await asyncio.to_thread(self._foreign_procs, job) or [])
-        }
+        # `seen` stays None until a reading succeeds: if the very first probe is unknown, an empty set
+        # would make every already-resident process look "fresh" on the next poll, and `stop`/`kill`
+        # would signal work that was there before the lease.
+        seen: set[int] | None = None
+        initial = await asyncio.to_thread(self._foreign_procs, job)
+        if initial is not None:
+            seen = {proc.pid for proc in initial}
         while self.running is job:
             await asyncio.sleep(self.cfg.foreign_poll_seconds)
             if self.running is not job:
                 return
             foreign = await asyncio.to_thread(self._foreign_procs, job)
             if foreign is None:  # unknown: never signal on a reading we cannot attribute
+                continue
+            if seen is None:  # first good reading: adopt what is already there, signal nothing
+                seen = {proc.pid for proc in foreign}
                 continue
             fresh = [proc for proc in foreign if proc.pid not in seen]
             if not fresh:
@@ -709,7 +730,6 @@ class Broker:
             job.state = "done" if code == 0 else "failed"
         except asyncio.CancelledError:
             job.state = "cancelled"
-            job.emit("cancelled")
         except Exception as exc:
             job.state = "failed"
             job.error = str(exc)
@@ -720,9 +740,11 @@ class Broker:
                     await watcher
             job.ended_at = time.time()
             self.running = None
+            # One emit, after the broker's own state is consistent: a client that reacts to
+            # "cancelled" then asks for status must never see this job still holding the lease.
             if job.state in ("done", "failed"):
                 job.emit(job.state, exit_code=job.exit_code, error=job.error)
-            elif job.state != "cancelled":
+            else:
                 job.state = "cancelled"
                 job.emit("cancelled")
             self._remember(job)
@@ -974,12 +996,7 @@ class Broker:
                 cancelled = self.cancel(token)
                 reply: dict[str, Any] = {"cancelled": cancelled}
                 if not cancelled:
-                    matches = self._matches(token)
-                    reply["error"] = (
-                        f"no live job matching {token!r}"
-                        if not matches
-                        else f"{token!r} matches {len(matches)} live jobs: {', '.join(matches)}"
-                    )
+                    reply["error"] = self._missing_job_error(token)
                 await self._reply(writer, reply)
             elif op == "pause":
                 await self._reply(writer, self.pause(str(request.get("id", ""))))

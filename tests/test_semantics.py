@@ -262,6 +262,16 @@ def test_admission_waits_for_a_stopping_baseline_instead_of_refusing():
     assert job.state == "done", job.error
 
 
+def test_queued_event_carries_need_and_priority_for_the_client():
+    broker = Broker(cfg_for(), Rig())
+    job = broker.submit(argv=["true"], need_gb=8, priority=3)
+    event = job.events.get_nowait()
+    assert event["ev"] == "queued"
+    assert event["need_gb"] == 8
+    assert event["priority"] == 3
+    assert event["position"] == 1
+
+
 def test_unknown_attribution_is_never_treated_as_an_empty_card():
     class BlindUnits(Rig):
         def unit_pids(self, unit):

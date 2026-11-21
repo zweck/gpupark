@@ -3,6 +3,8 @@
 import asyncio
 import signal
 
+import pytest
+
 from gpupark import config, gpu
 from gpupark.daemon import Broker, Host
 
@@ -114,7 +116,8 @@ def test_a_failed_probe_is_unknown_not_empty(monkeypatch):
         raise FileNotFoundError("nvidia-smi")
 
     monkeypatch.setattr(gpu.subprocess, "run", boom)
-    assert gpu.processes() == []
+    with pytest.raises(gpu.GpuError):
+        gpu.processes()
 
 
 def test_processes_parses_nvidia_smi_rows(monkeypatch):

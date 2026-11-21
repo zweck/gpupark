@@ -24,11 +24,20 @@ def _systemctl(*args: str, timeout: float = 30) -> subprocess.CompletedProcess:
 
 
 def is_active(unit: str) -> bool:
-    """True while the unit still occupies anything — including `deactivating`.
+    """True while the unit is up or coming up. Deliberately excludes `deactivating`.
 
-    Treating `deactivating` as inactive made `wait_inactive()` return immediately while the unit
-    was still stopping and still holding its VRAM, so the broker could park the baseline and then
-    refuse the job in the same second.
+    A starting check must not be fooled by a unit that is on its way down (start it again), which
+    is why teardown has its own predicate: `still_occupying`.
+    """
+    result = _systemctl("is-active", "--", unit, timeout=10)
+    return result.stdout.strip() in ("active", "activating", "reloading")
+
+
+def still_occupying(unit: str) -> bool:
+    """True while the unit may still hold its resources — including `deactivating`.
+
+    `is-active` reports `deactivating` as inactive the instant a stop begins, so a `wait_inactive`
+    built on `is_active` returns while the unit is still tearing down and its VRAM is still held.
     """
     result = _systemctl("is-active", "--", unit, timeout=10)
     return result.stdout.strip() in ("active", "activating", "reloading", "deactivating")
@@ -79,7 +88,7 @@ def wait_active(unit: str, timeout: float, interval: float = 0.5) -> bool:
 def wait_inactive(unit: str, timeout: float, interval: float = 0.5) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not is_active(unit):
+        if not still_occupying(unit):
             return True
         time.sleep(interval)
     return False

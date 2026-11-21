@@ -49,8 +49,10 @@ def processes(index: int = 0) -> list[Proc]:
             text=True,
             timeout=15,
         ).stdout
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return []
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        # raise rather than answer []: "the probe failed" and "nothing is on the card" are different
+        # facts, and the broker's foreign policy acts on the difference
+        raise GpuError(f"nvidia-smi --query-compute-apps failed: {exc}") from exc
     procs: list[Proc] = []
     for line in out.strip().splitlines():
         parts = [part.strip() for part in line.split(",")]

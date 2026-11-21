@@ -69,3 +69,21 @@ def wait_inactive(unit: str, timeout: float, interval: float = 0.5) -> bool:
             return True
         time.sleep(interval)
     return False
+
+
+def result(unit: str) -> tuple[str, int]:
+    """(Result, ExecMainStatus) as systemd reports them, so a dead unit is not mistaken for a clean exit.
+
+    `Result` is "success" for a clean exit, otherwise "exit-code", "signal", "timeout", ...;
+    `ExecMainStatus` is the exit status or signal number that goes with it.
+    """
+    shown = _systemctl(
+        "show", "-p", "Result", "-p", "ExecMainStatus", "--value", "--", unit, timeout=10
+    )
+    lines = [line.strip() for line in (shown.stdout or "").splitlines() if line.strip()]
+    name = lines[0] if lines else ""
+    try:
+        status = int(lines[1]) if len(lines) > 1 else 0
+    except ValueError:
+        status = 0
+    return name, status

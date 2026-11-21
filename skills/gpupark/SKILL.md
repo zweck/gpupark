@@ -49,8 +49,11 @@ gpupark lease comfyui --for 1800          # hold a registered unit (e.g. a UI se
   high blocks the queue behind a card that will never be that empty; too low and
   your job OOMs after the baseline was already parked.
 - `--ttl` is the lease ceiling in seconds. Always set it for renders and training
-  runs. When it expires the broker stops your workload and restores the baseline; a
-  command job stopped this way exits **124** with `lease expired`, not 0.
+  runs. When it expires the broker stops your workload and restores the baseline; the
+  job exits **124** with `lease expired`, not 0 — for a unit workload too.
+- **A job's output outlives its client.** Everything the job prints is tee'd to
+  `<state dir>/logs/<id>.log`, and `gpupark logs <id>` (or `gpupark history`) reads it
+  back after a killed wrapper, so a lost terminal never means lost output.
 - `--priority` is higher-first, FIFO on ties. Leave it at 0 unless the human asked
   you to jump the queue.
 - The command's stdout/stderr stream to you and its exit code becomes `gpupark`'s.

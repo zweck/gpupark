@@ -69,6 +69,35 @@ def _fail(message: str, code: int = 1) -> int:
     return code
 
 
+def _dur(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def _clock(job: dict) -> str:
+    """', up 12m, ttl 28m left' — the clocks an agent would otherwise have to infer."""
+    bits = []
+    active = job.get("active_seconds")
+    if active is not None:
+        bits.append(f"up {_dur(active)}")
+    left = job.get("ttl_remaining")
+    if left is not None:
+        bits.append(f"ttl {_dur(left)} left")
+    elif job.get("started_at"):
+        bits.append("no ttl")
+    return (", " + ", ".join(bits)) if bits else ""
+
+
+def _state_dir() -> Path:
+    with contextlib.suppress(Exception):
+        return config_mod.load().artifacts_dir()
+    return config_mod.default_state_path().parent
+
+
 # ----------------------------------------------------------------- daemon
 
 @app.command()
@@ -136,6 +165,18 @@ def run(
         argv = _raw[_raw.index("--") + 1:]
     if not argv:
         raise typer.BadParameter("give a command after '--'")
+    try:
+        _flags = sys.argv[1:]
+        _head = _flags[:_flags.index("--")] if "--" in _flags else _flags
+        need_given = any(item == "--need" or item.startswith("--need=") for item in _head)
+    except Exception:
+        need_given = need > 0
+    if not need_given and not quiet:
+        typer.echo(
+            "warning: no --need given — the baseline is not parked and the job runs beside the "
+            "resident model; pass --need <GB> for GPU work",
+            err=True,
+        )
     code = 0
     for event in _call(
         {"op": "submit", "argv": argv, "need_gb": need, "priority": priority, "ttl": ttl}, stream=True
@@ -188,9 +229,11 @@ def lease(
 
 @app.command()
 def cancel(job_id: str) -> None:
-    """Cancel a queued job or stop a running one."""
+    """Cancel a queued job, or stop a running one (an id prefix is enough when it is unique)."""
     for event in _call({"op": "cancel", "id": job_id}):
-        typer.echo("cancelled" if event.get("cancelled") else f"no such live job: {job_id}")
+        typer.echo(
+            "cancelled" if event.get("cancelled") else f"no live job matching {job_id!r}"
+        )
         raise typer.Exit(0 if event.get("cancelled") else 1)
 
 
@@ -277,7 +320,9 @@ def status(as_json: bool = typer.Option(False, "--json")) -> None:
         typer.echo(f"baseline: {meta.get('name') or '-'} ({meta.get('state')})")
         if running:
             what = running.get("workload") or " ".join(running.get("argv") or [])
-            typer.echo(f"lease: {running['id']} {what} (need {running['need_gb']:.1f} GB)")
+            typer.echo(
+                f"lease: {running['id']} {what} (need {running['need_gb']:.1f} GB{_clock(running)})"
+            )
         else:
             typer.echo("lease: free")
         foreign = snapshot.get("foreign") or []
@@ -290,10 +335,65 @@ def status(as_json: bool = typer.Option(False, "--json")) -> None:
         typer.echo(f"queue: {len(queue)}")
         for job in queue:
             what = job.get("workload") or " ".join(job.get("argv") or [])
-            typer.echo(f"  {job['id']}  {what}  (need {job['need_gb']:.1f} GB)")
+            waiting = job.get("queued_for")
+            waited = f", waiting {_dur(waiting)}" if waiting else ""
+            typer.echo(f"  {job['id']}  {what}  (need {job['need_gb']:.1f} GB{waited})")
         for job in snapshot.get("paused") or []:
             what = job.get("workload") or " ".join(job.get("argv") or [])
             typer.echo(f"  paused: {job['id']}  {what}  (need {job['need_gb']:.1f} GB) — 'gpupark resume'")
+
+
+@app.command()
+def history(
+    as_json: bool = typer.Option(False, "--json"),
+    limit: int = typer.Option(20, "--limit", help="how many of the most recent jobs to show"),
+) -> None:
+    """Show recently finished jobs: exit code, how long they waited and ran."""
+    for snapshot in _call({"op": "history"}):
+        rows = list(snapshot.get("recent") or [])[-limit:] if limit > 0 else []
+        if as_json:
+            typer.echo(json.dumps(rows, indent=2))
+            return
+        if not rows:
+            typer.echo("no finished jobs yet")
+            return
+        for row in rows:
+            what = row.get("workload") or " ".join(row.get("argv") or [])
+            bits = []
+            if row.get("exit_code") is not None:
+                bits.append(f"exit {row['exit_code']}")
+            if row.get("wait_seconds") is not None:
+                bits.append(f"queued {_dur(row['wait_seconds'])}")
+            if row.get("run_seconds") is not None:
+                bits.append(f"ran {_dur(row['run_seconds'])}")
+            typer.echo(f"{row['id']}  {str(row.get('state')):<9} {what}  ({', '.join(bits)})")
+            if row.get("error"):
+                typer.echo(f"    {row['error']}")
+
+
+@app.command()
+def logs(
+    job_id: str = typer.Argument(..., help="job id, or a unique prefix"),
+    lines: int = typer.Option(200, "--lines", "-n", help="how many trailing lines to print"),
+    path_only: bool = typer.Option(False, "--path", help="print the log path instead of its text"),
+) -> None:
+    """Print a job's own output log, so a lost client does not lose the job's output."""
+    log_dir = _state_dir() / "logs"
+    matches = sorted(log_dir.glob(f"{job_id}*.log")) if log_dir.exists() else []
+    if not matches:
+        raise typer.Exit(_fail(f"no log for job {job_id!r} in {log_dir}"))
+    if len(matches) > 1:
+        names = ", ".join(item.stem for item in matches[:6])
+        raise typer.Exit(
+            _fail(f"{job_id!r} matches {len(matches)} logs ({names}); give more characters")
+        )
+    target = matches[0]
+    if path_only:
+        typer.echo(str(target))
+        return
+    text = target.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in text[-lines:] if lines > 0 else text:
+        typer.echo(line)
 
 
 @app.command()

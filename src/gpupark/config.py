@@ -119,6 +119,11 @@ class Config:
             known = ", ".join(sorted(self.workloads)) or "none"
             raise KeyError(f"unknown workload {name!r} (known: {known})") from None
 
+    def artifacts_dir(self) -> Path:
+        """Where job logs live: the parent of a state FILE, or the path itself when it is a directory."""
+        path = Path(self.state_path)
+        return path.parent if path.suffix else path
+
 
 def parse(raw: dict[str, Any]) -> Config:
     cfg = Config(

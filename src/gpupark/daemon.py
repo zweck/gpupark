@@ -21,6 +21,7 @@ from . import config as config_mod
 from . import gpu, systemd
 
 EVENTS_MAX = 4096  # bounded per-job buffer: a client that stops reading cannot OOM the broker
+HISTORY_MAX = 50  # finished jobs kept for `gpupark history` (and for cancelling by prefix)
 
 
 @dataclass
@@ -45,10 +46,19 @@ class Job:
     proc: Any = None  # asyncio.subprocess.Process for command jobs
     pgid: int | None = None  # process group captured at spawn (never re-derived after exit)
     dropped: int = 0  # output lines dropped because nobody was reading
+    log_path: str | None = None  # where this job's output is teed (None when it could not open)
+    log_handle: Any = None  # the open log file, closed when the job is remembered
     events: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=EVENTS_MAX))
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
 
     def emit(self, event: str, **fields: Any) -> None:
+        # Tee the job's own output to its log file: a client that dies (a wrapper timeout, a killed
+        # terminal) must not take the only copy of the job's output with it.
+        if event == "output" and self.log_handle is not None:
+            try:
+                self.log_handle.write(str(fields.get("line", "")) + "\n")
+            except Exception:
+                self.log_handle = None
         try:
             self.events.put_nowait({"ev": event, "id": self.id, **fields})
         except asyncio.QueueFull:
@@ -64,7 +74,10 @@ class Job:
             paused += now - self.paused_since
         return max(0.0, now - (self.started_at or now) - paused)
 
-    def public(self) -> dict[str, Any]:
+    def public(self, now: float | None = None) -> dict[str, Any]:
+        """The job as the wire sees it, with the clocks a client would otherwise have to infer."""
+        now = time.time() if now is None else now
+        active = self.active_seconds(now) if self.started_at else None
         return {
             "id": self.id,
             "state": self.state,
@@ -77,6 +90,14 @@ class Job:
             "ended_at": self.ended_at,
             "exit_code": self.exit_code,
             "error": self.error,
+            "queued_for": round(now - self.submitted_at, 1) if self.state == "queued" else None,
+            "active_seconds": round(active, 1) if active is not None else None,
+            "ttl": self.ttl,
+            "ttl_remaining": (
+                round(max(0.0, self.ttl - active), 1) if self.ttl and active is not None else None
+            ),
+            "dropped": self.dropped,
+            "log": self.log_path,
         }
 
 
@@ -123,6 +144,16 @@ class Host:
     def signal_pid(self, pid: int, sig: int) -> None:
         os.kill(pid, sig)
 
+    def unit_failure(self, unit: str) -> str | None:
+        """Why a unit that is not active stopped, when systemd says it failed; None if it exited cleanly."""
+        try:
+            result, status = systemd.result(unit)
+        except Exception:
+            return None
+        if result in ("", "success") and status == 0:
+            return None
+        return f"Result={result or '?'} ExecMainStatus={status}"
+
 
 class Broker:
     def __init__(self, cfg: config_mod.Config, host: Host | None = None) -> None:
@@ -130,6 +161,7 @@ class Broker:
         self.host = host or Host(cfg.gpu_probe)
         self.jobs: dict[str, Job] = {}
         self.order: list[str] = []
+        self.recent: list[dict[str, Any]] = []  # bounded history of finished jobs
         self.running: Job | None = None
         self.baseline_state = "unknown"
         self.scheduler_alive = False
@@ -182,8 +214,19 @@ class Broker:
         except ValueError:
             return 0
 
+    def resolve(self, token: str) -> str | None:
+        """An exact job id, or the single live job whose id starts with `token`."""
+        token = (token or "").strip().lower()
+        if not token:
+            return None
+        if token in self.jobs:
+            return token
+        matches = [job_id for job_id in self.jobs if job_id.startswith(token)]
+        return matches[0] if len(matches) == 1 else None
+
     def cancel(self, job_id: str) -> bool:
-        job = self.jobs.get(job_id)
+        token = self.resolve(job_id)
+        job = self.jobs.get(token) if token else None
         if job is None:
             return False
         if job.state in ("done", "failed", "cancelled"):
@@ -243,6 +286,53 @@ class Broker:
         with contextlib.suppress(ValueError):
             self.order.remove(job.id)
 
+    def _remember(self, job: Job) -> None:
+        """Keep a short history of what happened, and finish the job's log file.
+
+        A client that loses its `queued <id>` line (a killed wrapper, a `timeout`) otherwise has no
+        way back to the job; the history lets `gpupark history` and `cancel <prefix>` still reach it.
+        """
+        now = time.time()
+        record = job.public(now)
+        record["wait_seconds"] = (
+            round(job.started_at - job.submitted_at, 1) if job.started_at else None
+        )
+        record["run_seconds"] = (
+            round((job.ended_at or now) - job.started_at, 1) if job.started_at else None
+        )
+        self.recent.append(record)
+        del self.recent[:-HISTORY_MAX]
+        handle = job.log_handle
+        job.log_handle = None
+        if handle is not None:
+            with contextlib.suppress(Exception):
+                handle.write(
+                    f"# {job.state} exit={job.exit_code} after {record['run_seconds']}s "
+                    f"at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
+                handle.close()
+
+    def _open_log(self, job: Job) -> None:
+        """Tee this job's output to `state_path/logs/<id>.log` (line buffered)."""
+        try:
+            path = self.cfg.artifacts_dir() / "logs" / f"{job.id}.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = path.open("w", encoding="utf-8", errors="replace", buffering=1)
+        except OSError as exc:
+            self._note_error(exc)
+            return
+        job.log_path = str(path)
+        job.log_handle = handle
+        what = " ".join(job.argv or []) or job.workload_name or ""
+        self._log_line(job, f"# gpupark job {job.id} {what}")
+        self._log_line(job, f"# started {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    @staticmethod
+    def _log_line(job: Job, text: str) -> None:
+        if job.log_handle is not None:
+            with contextlib.suppress(Exception):
+                job.log_handle.write(text + "\n")
+
     def _next_job(self) -> Job | None:
         pending = [self.jobs[j] for j in self.order if self.jobs[j].state == "queued"]
         if not pending:
@@ -269,14 +359,27 @@ class Broker:
         except Exception:
             foreign_view = []
         baseline = self.cfg.baseline()
+        now = time.time()
+        queued = [self.jobs[j] for j in self.order if self.jobs[j].state == "queued"]
+        current = self.running
+        running_view = current.public(now) if current else None
+        if running_view is not None and current is not None:
+            running_view["pid"] = getattr(current.proc, "pid", None)
         return {
-            "running": self.running.public() if self.running else None,
+            "running": running_view,
             "foreign": foreign_view,
-            "queue": [self.jobs[j].public() for j in self.order if self.jobs[j].state == "queued"],
+            "queue": [
+                {**job.public(now), "position": index + 1} for index, job in enumerate(queued)
+            ],
             "paused": [
-                self.jobs[j].public() for j in self.order if self.jobs[j].state == "paused"
+                self.jobs[j].public(now) for j in self.order if self.jobs[j].state == "paused"
             ]
-            + ([self.running.public()] if self.running and self.running.pause_request else []),
+            + (
+                [self.running.public(now)]
+                if self.running and self.running.pause_request
+                else []
+            ),
+            "recent": self.recent[-10:],
             "baseline": {
                 "name": baseline.name if baseline else None,
                 "state": self.baseline_state,
@@ -473,9 +576,18 @@ class Broker:
         watcher: asyncio.Task | None = None
         try:
             if job.need_gb > 0:
+                if self.cfg.gpu_probe != "none":
+                    total, _used = await asyncio.to_thread(self.host.gpu_memory, self.cfg.gpu)
+                    if job.need_gb * 1024 > total:
+                        raise RuntimeError(
+                            f"{job.need_gb:.1f} GB requested but gpu {self.cfg.gpu} has only "
+                            f"{total / 1024:.1f} GB in total; the baseline was left running"
+                        )
                 await self._park_baseline()
                 await self._admission(job)
-                if not await self._wait_free(job.need_gb, timeout=job.ttl or self.cfg.grant_timeout):
+                # The wait for VRAM is bounded by grant_timeout, never by the lease ceiling: a job
+                # with --ttl 3600 would otherwise keep the baseline parked for an hour before failing.
+                if not await self._wait_free(job.need_gb, timeout=self.cfg.grant_timeout):
                     foreign = await asyncio.to_thread(self._foreign_procs, job)
                     hint = f" — held by {self._describe(foreign)}" if foreign else ""
                     raise RuntimeError(
@@ -508,6 +620,7 @@ class Broker:
                 job.emit(job.state, exit_code=job.exit_code, error=job.error)
             else:
                 job.emit("cancelled")
+            self._remember(job)
             self._forget(job)
             if workload is not None and workload.kind == "unit" and not job.hold:
                 with contextlib.suppress(Exception):
@@ -517,8 +630,10 @@ class Broker:
                 await self._restore_baseline()
 
     async def _execute(self, job: Job, workload: config_mod.Workload | None) -> int:
+        self._open_log(job)
         if workload is not None and workload.kind == "unit":
             unit = str(workload.target)
+            self._log_line(job, f"# workload {unit} starting")
             await asyncio.to_thread(self.host.start_unit, unit)
             if not await asyncio.to_thread(self.host.wait_active, unit, workload.ready_timeout):
                 raise RuntimeError(f"{unit} did not become active within {workload.ready_timeout:.0f}s")
@@ -540,16 +655,25 @@ class Broker:
                     await asyncio.to_thread(self.host.start_unit, unit)
                     await asyncio.to_thread(self.host.wait_active, unit, workload.ready_timeout)
                     job.suspended = False
+                    self._log_line(job, f"# workload {unit} resumed")
                     continue
                 if job.suspended:
                     # paused: a stopped unit is expected, not the job finishing
                     await asyncio.sleep(0.5)
                     continue
                 if not await asyncio.to_thread(self.host.is_active, unit):
+                    reason = await asyncio.to_thread(self.host.unit_failure, unit)
+                    self._log_line(job, f"# workload {unit} inactive ({reason or 'clean exit'})")
+                    if reason:
+                        raise RuntimeError(f"{unit} stopped unexpectedly ({reason})")
                     return 0
                 if job.ttl and job.active_seconds() >= job.ttl:
                     await asyncio.to_thread(self.host.stop_unit, unit)
-                    return 0
+                    self._log_line(job, f"# workload {unit} stopped: lease expired")
+                    job.error = (
+                        f"lease expired after {job.ttl:.0f}s (--ttl); the workload was stopped"
+                    )
+                    return 124
                 await asyncio.sleep(1.0)
         argv = job.argv or (workload.argv() if workload else [])
         proc = await asyncio.create_subprocess_exec(
@@ -736,6 +860,8 @@ class Broker:
                 await self._reply(writer, self.resume(str(request.get("id", ""))))
             elif op == "ping":
                 await self._reply(writer, {"pong": True})
+            elif op == "history":
+                await self._reply(writer, {"recent": self.recent})
             elif op == "submit":
                 self._check_request(request)
                 job = self.submit(

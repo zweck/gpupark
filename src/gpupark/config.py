@@ -120,9 +120,18 @@ class Config:
             raise KeyError(f"unknown workload {name!r} (known: {known})") from None
 
     def artifacts_dir(self) -> Path:
-        """Where job logs live: the parent of a state FILE, or the path itself when it is a directory."""
-        path = Path(self.state_path)
-        return path.parent if path.suffix else path
+        """Where job logs live.
+
+        An existing directory is used as-is; an existing file (or a `*.json` state path) uses its
+        parent; anything else is treated as a directory. A dotted directory name (`gpupark.d`) is
+        therefore still a directory, and `~` is expanded because the value comes from YAML.
+        """
+        path = Path(self.state_path).expanduser()
+        if path.is_dir():
+            return path
+        if path.is_file() or path.suffix == ".json":
+            return path.parent
+        return path
 
 
 def parse(raw: dict[str, Any]) -> Config:
@@ -159,6 +168,10 @@ def parse(raw: dict[str, Any]) -> Config:
         )
     if cfg.gpu_probe not in ("auto", "none"):
         raise ValueError(f"gpu_probe must be 'auto' or 'none', not {cfg.gpu_probe!r}")
+    if cfg.foreign_poll_seconds <= 0:
+        raise ValueError("foreign_poll_seconds must be > 0 (a zero poll spins nvidia-smi)")
+    if cfg.poll_seconds < 0:
+        raise ValueError("poll_seconds must be >= 0")
     return cfg
 
 

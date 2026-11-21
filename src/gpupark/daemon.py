@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import fcntl
 import json
@@ -21,7 +22,9 @@ from . import config as config_mod
 from . import gpu, systemd
 
 EVENTS_MAX = 4096  # bounded per-job buffer: a client that stops reading cannot OOM the broker
-HISTORY_MAX = 50  # finished jobs kept for `gpupark history` (and for cancelling by prefix)
+HISTORY_MAX = 50  # finished jobs kept for `gpupark history` (an id recovered after the fact)
+LOG_MAX_BYTES = 64 * 1024 * 1024  # per-job output cap: tmpfs state dirs must not fill up
+LOG_KEEP = 200  # newest job logs kept on disk
 
 
 @dataclass
@@ -48,16 +51,27 @@ class Job:
     dropped: int = 0  # output lines dropped because nobody was reading
     log_path: str | None = None  # where this job's output is teed (None when it could not open)
     log_handle: Any = None  # the open log file, closed when the job is remembered
+    log_bytes: int = 0  # bytes written to the log, against LOG_MAX_BYTES
     events: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=EVENTS_MAX))
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
 
     def emit(self, event: str, **fields: Any) -> None:
         # Tee the job's own output to its log file: a client that dies (a wrapper timeout, a killed
-        # terminal) must not take the only copy of the job's output with it.
+        # terminal) must not take the only copy of the job's output with it. The cap keeps a
+        # chatty job from filling a tmpfs state dir.
         if event == "output" and self.log_handle is not None:
+            line = str(fields.get("line", "")) + "\n"
             try:
-                self.log_handle.write(str(fields.get("line", "")) + "\n")
+                if self.log_bytes + len(line) > LOG_MAX_BYTES:
+                    self.log_handle.write("# output truncated: log size cap reached\n")
+                    self.log_handle.close()
+                    self.log_handle = None
+                else:
+                    self.log_handle.write(line)
+                    self.log_bytes += len(line)
             except Exception:
+                with contextlib.suppress(Exception):
+                    self.log_handle.close()
                 self.log_handle = None
         try:
             self.events.put_nowait({"ev": event, "id": self.id, **fields})
@@ -108,8 +122,9 @@ class NoProbe(RuntimeError):
 class Host:
     """Every side effect the broker performs, in one place (fakeable in tests)."""
 
-    def __init__(self, probe: str = "auto") -> None:
+    def __init__(self, probe: str = "auto", index: int = 0) -> None:
         self.probe = probe
+        self.index = index
 
     def gpu_memory(self, index: int) -> tuple[int, int]:
         if self.probe == "none":
@@ -134,12 +149,21 @@ class Host:
     def gpu_processes(self) -> list[gpu.Proc]:
         if self.probe == "none":
             return []
-        return gpu.processes()
+        return gpu.processes(self.index)
 
     def unit_pids(self, unit: str) -> set[int]:
-        """Live PIDs belonging to a unit (its MainPID subtree), for attributing GPU memory."""
+        """Live PIDs belonging to a unit (MainPID tree and its process group).
+
+        Raises when systemd cannot answer: the caller must treat that as "unknown", never as
+        "this unit holds nothing", because the pids are what protects the unit from the
+        foreign-policy pass.
+        """
         pid = systemd.main_pid(unit)
-        return gpu.process_tree(pid) if pid else set()
+        if not pid:
+            return set()
+        table = gpu.proc_table()
+        pgrp = table.get(pid, (0, 0))[1] or pid
+        return gpu.process_tree(pid, table) | gpu.process_group(pgrp, table)
 
     def signal_pid(self, pid: int, sig: int) -> None:
         os.kill(pid, sig)
@@ -214,14 +238,22 @@ class Broker:
         except ValueError:
             return 0
 
-    def resolve(self, token: str) -> str | None:
-        """An exact job id, or the single live job whose id starts with `token`."""
+    LIVE_STATES = ("queued", "admitting", "granted", "running", "paused")
+
+    def _matches(self, token: str) -> list[str]:
+        """Live job ids starting with `token` (a finished job never shadows a live one)."""
         token = (token or "").strip().lower()
         if not token:
-            return None
-        if token in self.jobs:
-            return token
-        matches = [job_id for job_id in self.jobs if job_id.startswith(token)]
+            return []
+        return [
+            job_id
+            for job_id, job in self.jobs.items()
+            if job.state in self.LIVE_STATES and job_id.startswith(token)
+        ]
+
+    def resolve(self, token: str) -> str | None:
+        """The single live job whose id matches `token`, or None when missing or ambiguous."""
+        matches = self._matches(token)
         return matches[0] if len(matches) == 1 else None
 
     def cancel(self, job_id: str) -> bool:
@@ -229,13 +261,13 @@ class Broker:
         job = self.jobs.get(token) if token else None
         if job is None:
             return False
-        if job.state in ("done", "failed", "cancelled"):
-            return False
         job.cancel.set()
-        if job.state == "queued":
+        if job.state in ("queued", "paused"):
             job.state = "cancelled"
             job.ended_at = time.time()
             job.emit("cancelled")
+            self._remember(job)  # a cancelled job still belongs in the history ...
+            self._forget(job)  # ... and must not shadow a later job's id prefix
         self._wake.set()
         return True
 
@@ -246,9 +278,14 @@ class Broker:
         baseline comes back; a running command is SIGSTOPped, which does not free
         its VRAM (a suspended CUDA process keeps its allocations).
         """
-        job = self.jobs.get(job_id)
+        job = self.jobs.get(self.resolve(job_id) or "") or None
         if job is None:
-            return {"ok": False, "error": f"no such job {job_id!r}"}
+            return {"ok": False, "error": f"no live job matching {job_id!r}"}
+        if job.state == "admitting":
+            return {
+                "ok": False,
+                "error": "the job is still preparing (parking the baseline); cancel it instead",
+            }
         if job.state == "queued":
             job.state = "paused"
             return {"ok": True, "state": "paused", "note": "held in the queue; not granted until resumed"}
@@ -265,9 +302,9 @@ class Broker:
         return {"ok": False, "error": f"cannot pause a job that is {job.state}"}
 
     def resume(self, job_id: str) -> dict[str, Any]:
-        job = self.jobs.get(job_id)
+        job = self.jobs.get(self.resolve(job_id) or "") or None
         if job is None:
-            return {"ok": False, "error": f"no such job {job_id!r}"}
+            return {"ok": False, "error": f"no live job matching {job_id!r}"}
         if job.state == "paused":
             job.state = "queued"
             self._wake.set()
@@ -306,8 +343,9 @@ class Broker:
         job.log_handle = None
         if handle is not None:
             with contextlib.suppress(Exception):
+                note = f" error={job.error!r}" if job.error else ""
                 handle.write(
-                    f"# {job.state} exit={job.exit_code} after {record['run_seconds']}s "
+                    f"# {job.state} exit={job.exit_code}{note} after {record['run_seconds']}s "
                     f"at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
                 )
                 handle.close()
@@ -315,8 +353,15 @@ class Broker:
     def _open_log(self, job: Job) -> None:
         """Tee this job's output to `state_path/logs/<id>.log` (line buffered)."""
         try:
-            path = self.cfg.artifacts_dir() / "logs" / f"{job.id}.log"
-            path.parent.mkdir(parents=True, exist_ok=True)
+            log_dir = self.cfg.artifacts_dir() / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(OSError):
+                existing = sorted(
+                    log_dir.glob("*.log"), key=lambda item: item.stat().st_mtime, reverse=True
+                )
+                for stale in existing[LOG_KEEP:]:
+                    stale.unlink()
+            path = log_dir / f"{job.id}.log"
             handle = path.open("w", encoding="utf-8", errors="replace", buffering=1)
         except OSError as exc:
             self._note_error(exc)
@@ -352,15 +397,18 @@ class Broker:
             }
         except Exception as exc:  # nvidia-smi may be missing on a test box
             gpu_view = {"index": self.cfg.gpu, "error": str(exc)}
+        foreign_unknown = False
         try:
-            foreign_view = [
-                proc.public() for proc in await asyncio.to_thread(self._foreign_procs, self.running)
-            ]
+            probed = await asyncio.to_thread(self._foreign_procs, self.running)
+            foreign_view = [proc.public() for proc in (probed or [])]
+            foreign_unknown = probed is None
         except Exception:
             foreign_view = []
+            foreign_unknown = True
         baseline = self.cfg.baseline()
         now = time.time()
         queued = [self.jobs[j] for j in self.order if self.jobs[j].state == "queued"]
+        queued.sort(key=lambda job: (-job.priority, job.submitted_at))
         current = self.running
         running_view = current.public(now) if current else None
         if running_view is not None and current is not None:
@@ -368,6 +416,7 @@ class Broker:
         return {
             "running": running_view,
             "foreign": foreign_view,
+            "foreign_unknown": foreign_unknown,
             "queue": [
                 {**job.public(now), "position": index + 1} for index, job in enumerate(queued)
             ],
@@ -457,30 +506,38 @@ class Broker:
     # ------------------------------------------------------- lease integrity
 
     def _lease_pids(self, job: Job | None) -> set[int]:
-        """PIDs that may legitimately hold VRAM under this lease."""
+        """PIDs that may legitimately hold VRAM under this lease.
+
+        Raises when systemd cannot enumerate a unit: the caller turns that into "unknown" rather
+        than an empty set, which would let the foreign policy signal our own workload.
+        """
         known: set[int] = set()
+        table = gpu.proc_table()
         if job is not None:
-            for holder in (getattr(job.proc, "pid", None), job.pgid):
+            for holder in {getattr(job.proc, "pid", None), job.pgid}:
                 if holder:
-                    known |= gpu.process_tree(int(holder))
+                    known |= gpu.process_tree(int(holder), table)
+            if job.pgid:
+                known |= gpu.process_group(int(job.pgid), table)
         for workload in self.cfg.workloads.values():
             if workload.kind == "unit":
-                with contextlib.suppress(Exception):
-                    known |= self.host.unit_pids(str(workload.target))
+                known |= self.host.unit_pids(str(workload.target))
         return known
 
-    def _foreign_procs(self, job: Job | None = None) -> list[gpu.Proc]:
+    def _foreign_procs(self, job: Job | None = None) -> list[gpu.Proc] | None:
         """GPU processes belonging neither to this lease nor to a registered unit.
 
-        A failed probe returns [] ("unknown"), never a claim that nothing is there.
+        None means UNKNOWN — the probe or systemd failed. Callers must never read that as
+        "nothing there": refusing a grant or signalling a pid on an unknown reading is how a
+        broker shoots its own workload.
         """
         if self.cfg.gpu_probe == "none":
             return []
         try:
             procs = self.host.gpu_processes()
+            known = self._lease_pids(job)
         except Exception:
-            return []
-        known = self._lease_pids(job)
+            return None
         return [
             proc
             for proc in procs
@@ -500,16 +557,45 @@ class Broker:
             with contextlib.suppress(OSError):
                 self.host.signal_pid(proc.pid, sig)
 
-    async def _admission(self, job: Job) -> None:
-        """Refuse a lease the card cannot satisfy, naming what is in the way.
+    async def _preflight(self, job: Job) -> None:
+        """Refuse what the card can never satisfy, before the baseline is touched."""
+        if self.cfg.gpu_probe == "none" or job.need_gb <= 0:
+            return
+        total, _used = await asyncio.to_thread(self.host.gpu_memory, self.cfg.gpu)
+        need_mib = int(job.need_gb * 1024)
+        if need_mib > total:
+            raise RuntimeError(
+                f"{job.need_gb:.1f} GB requested but gpu {self.cfg.gpu} has only "
+                f"{total / 1024:.1f} GB in total ({total} MiB); the baseline was left running"
+            )
+        foreign = await asyncio.to_thread(self._foreign_procs, None)
+        if foreign:
+            held = sum(proc.used_mib for proc in foreign)
+            if total - held < need_mib:
+                raise RuntimeError(
+                    f"refusing to grant: even with the baseline parked, {held / 1024:.1f} GB is held by "
+                    f"{self._describe(foreign)} — processes gpupark does not manage, so {job.need_gb:.1f} GB "
+                    f"of a {total / 1024:.1f} GB card can never be free "
+                    f"(foreign_policy={self.cfg.foreign_policy})"
+                )
 
-        Runs after the baseline is parked, when every remaining megabyte belongs to a process
-        gpupark does not manage. A job that starts anyway dies mid-sampler with a CUDA allocation
-        error (`Fault failed: 2`) that reads like a broken graph.
+    async def _admission(self, job: Job) -> None:
+        """Refuse a lease the card still cannot satisfy now that the baseline has actually gone.
+
+        Runs AFTER the VRAM wait: a unit that is `deactivating` still holds its memory, and an
+        admission check against a half-freed card refuses work the card could run a second later.
+        A failed probe (None) skips the check instead of pretending the card is empty.
         """
         if self.cfg.gpu_probe == "none" or job.need_gb <= 0:
             return
         foreign = await asyncio.to_thread(self._foreign_procs, job)
+        if foreign is None:
+            job.emit("foreign", processes=[], blocked=False, unknown=True)
+            print(
+                "gpupark: GPU attribution unavailable (probe/systemd failed); admission skipped",
+                flush=True,
+            )
+            return
         if not foreign:
             return
         payload = [proc.public() for proc in foreign]
@@ -534,12 +620,16 @@ class Broker:
         """
         if self.cfg.gpu_probe == "none":
             return
-        seen = {proc.pid for proc in await asyncio.to_thread(self._foreign_procs, job)}
+        seen = {
+            proc.pid for proc in (await asyncio.to_thread(self._foreign_procs, job) or [])
+        }
         while self.running is job:
             await asyncio.sleep(self.cfg.foreign_poll_seconds)
             if self.running is not job:
                 return
             foreign = await asyncio.to_thread(self._foreign_procs, job)
+            if foreign is None:  # unknown: never signal on a reading we cannot attribute
+                continue
             fresh = [proc for proc in foreign if proc.pid not in seen]
             if not fresh:
                 continue
@@ -552,7 +642,9 @@ class Broker:
             )
             self._apply_foreign_policy(fresh)
 
-    async def _wait_free(self, need_gb: float, timeout: float) -> bool:
+    async def _wait_free(
+        self, need_gb: float, timeout: float, cancel: asyncio.Event | None = None
+    ) -> bool:
         if self.cfg.gpu_probe == "none":
             return True  # nothing to measure; the queue alone serialises work
         need_mib = int(need_gb * 1024)
@@ -563,6 +655,8 @@ class Broker:
 
         deadline = time.monotonic() + timeout
         while True:
+            if cancel is not None and cancel.is_set():
+                return False
             if await asyncio.to_thread(check):
                 return True
             if time.monotonic() >= deadline:
@@ -570,30 +664,39 @@ class Broker:
             await asyncio.sleep(self.cfg.poll_seconds)
 
     async def _run(self, job: Job) -> None:
-        job.started_at = time.time()
         self.running = job
         workload = self.cfg.workload(job.workload_name) if job.workload_name else None
         watcher: asyncio.Task | None = None
         try:
             if job.need_gb > 0:
-                if self.cfg.gpu_probe != "none":
-                    total, _used = await asyncio.to_thread(self.host.gpu_memory, self.cfg.gpu)
-                    if job.need_gb * 1024 > total:
-                        raise RuntimeError(
-                            f"{job.need_gb:.1f} GB requested but gpu {self.cfg.gpu} has only "
-                            f"{total / 1024:.1f} GB in total; the baseline was left running"
-                        )
+                # A job that is parked/admitted is NOT queued any more: state "admitting" keeps it out
+                # of the queue list (no double count in `status`) and tells cancel/pause what they
+                # are looking at. started_at stays unset until the lease is really granted, so the
+                # baseline teardown and the VRAM wait do not eat into --ttl.
+                job.state = "admitting"
+                job.emit("admitting")
+                await self._preflight(job)
+                if job.cancel.is_set():
+                    raise asyncio.CancelledError
                 await self._park_baseline()
-                await self._admission(job)
                 # The wait for VRAM is bounded by grant_timeout, never by the lease ceiling: a job
                 # with --ttl 3600 would otherwise keep the baseline parked for an hour before failing.
-                if not await self._wait_free(job.need_gb, timeout=self.cfg.grant_timeout):
+                if not await self._wait_free(
+                    job.need_gb, timeout=self.cfg.grant_timeout, cancel=job.cancel
+                ):
+                    if job.cancel.is_set():
+                        raise asyncio.CancelledError
                     foreign = await asyncio.to_thread(self._foreign_procs, job)
                     hint = f" — held by {self._describe(foreign)}" if foreign else ""
                     raise RuntimeError(
                         f"the GPU never freed {job.need_gb:.1f} GB (still in use by something "
                         f"gpupark does not manage?){hint}"
                     )
+                # after the teardown, not before it: a stopping baseline still holds its memory
+                await self._admission(job)
+            if job.cancel.is_set():
+                raise asyncio.CancelledError
+            job.started_at = time.time()
             # announce the lease only once the card can actually satisfy it: 'granted' followed
             # by an admission refusal reads as a broker that handed out something it did not have
             job.state = "granted"
@@ -606,6 +709,7 @@ class Broker:
             job.state = "done" if code == 0 else "failed"
         except asyncio.CancelledError:
             job.state = "cancelled"
+            job.emit("cancelled")
         except Exception as exc:
             job.state = "failed"
             job.error = str(exc)
@@ -618,14 +722,16 @@ class Broker:
             self.running = None
             if job.state in ("done", "failed"):
                 job.emit(job.state, exit_code=job.exit_code, error=job.error)
-            else:
+            elif job.state != "cancelled":
+                job.state = "cancelled"
                 job.emit("cancelled")
             self._remember(job)
             self._forget(job)
             if workload is not None and workload.kind == "unit" and not job.hold:
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(self.host.stop_unit, str(workload.target))
-            await asyncio.sleep(self.cfg.cooldown_seconds)
+            if job.started_at is not None:
+                await asyncio.sleep(self.cfg.cooldown_seconds)
             if self._next_job() is None:
                 await self._restore_baseline()
 
@@ -692,9 +798,13 @@ class Broker:
             # Never iterate lines here: one over-long line (a probe dumping a 250 KB JSON row, a progress
             # bar without a newline) overruns the stream limit and kills the job with "Separator is found,
             # but chunk is longer than limit". Read fixed chunks, split them here, and emit an over-long
-            # line as several pieces so the caller still receives all of it.
-            buf = b""
+            # line as several pieces so the caller still receives all of it. The pieces are decoded
+            # incrementally: slicing at a 64 KiB boundary must not split a multi-byte UTF-8 character
+            # into two replacement chars.
             piece = 64 * 1024
+            buf = b""
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            splitting = False
             while True:
                 chunk = await proc.stdout.read(piece)
                 if not chunk:
@@ -703,19 +813,26 @@ class Broker:
                 while True:
                     nl = buf.find(b"\n")
                     if nl >= 0:
-                        job.emit("output", line=buf[:nl].decode(errors="replace"))
+                        if splitting:
+                            text = decoder.decode(buf[:nl], final=True)
+                            decoder.reset()
+                            splitting = False
+                        else:
+                            text = buf[:nl].decode(errors="replace")
+                        job.emit("output", line=text)
                         buf = buf[nl + 1:]
                         continue
                     if len(buf) >= piece:
-                        job.emit("output", line=buf[:piece].decode(errors="replace"))
+                        job.emit("output", line=decoder.decode(buf[:piece]))
+                        splitting = True
                         buf = buf[piece:]
                         continue
                     break
-            while len(buf) >= piece:
-                job.emit("output", line=buf[:piece].decode(errors="replace"))
-                buf = buf[piece:]
             if buf:
-                job.emit("output", line=buf.decode(errors="replace"))
+                text = (
+                    decoder.decode(buf, final=True) if splitting else buf.decode(errors="replace")
+                )
+                job.emit("output", line=text)
 
         async def watch_pause() -> None:
             """SIGSTOP/SIGCONT the job's process group. VRAM stays allocated."""
@@ -853,7 +970,17 @@ class Broker:
             if op == "status":
                 await self._reply(writer, await self.status())
             elif op == "cancel":
-                await self._reply(writer, {"cancelled": self.cancel(str(request.get("id", "")))})
+                token = str(request.get("id", ""))
+                cancelled = self.cancel(token)
+                reply: dict[str, Any] = {"cancelled": cancelled}
+                if not cancelled:
+                    matches = self._matches(token)
+                    reply["error"] = (
+                        f"no live job matching {token!r}"
+                        if not matches
+                        else f"{token!r} matches {len(matches)} live jobs: {', '.join(matches)}"
+                    )
+                await self._reply(writer, reply)
             elif op == "pause":
                 await self._reply(writer, self.pause(str(request.get("id", ""))))
             elif op == "resume":

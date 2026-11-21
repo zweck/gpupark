@@ -11,6 +11,7 @@ class Rig(Host):
     """A GPU and a systemd, in memory, with the knobs each test needs."""
 
     def __init__(self, total_mib=24576, baseline_mib=20000, idle_mib=300):
+        super().__init__("none")
         self.total_mib = total_mib
         self.baseline_mib = baseline_mib
         self.idle_mib = idle_mib
@@ -46,6 +47,12 @@ class Rig(Host):
 
     def unit_failure(self, unit):
         return self.failure
+
+    def gpu_processes(self):
+        return []
+
+    def unit_pids(self, unit):
+        return set()
 
 
 def cfg_for(workloads=None, **extra):
@@ -182,14 +189,88 @@ def test_cancel_accepts_a_unique_id_prefix():
     broker = Broker(cfg_for(), Rig())
     first = broker.submit(argv=["true"])
     second = broker.submit(argv=["true"])
-    prefix = first.id[:4]
-    if second.id.startswith(prefix):
-        # make the prefix unambiguous without depending on random ids
-        second.id = "zz" + second.id
+    prefix = next(
+        first.id[:index]
+        for index in range(1, len(first.id) + 1)
+        if not second.id.startswith(first.id[:index])
+    )
     assert broker.cancel(prefix) is True
     assert first.state == "cancelled"
-    assert broker.jobs[second.id].state == "queued"
+    assert second.state == "queued"
     assert broker.cancel(prefix) is False, "a prefix must not cancel twice"
+
+
+def test_lease_event_stream_turns_a_failed_lease_into_a_nonzero_exit():
+    from gpupark import cli
+
+    failed = [
+        {"ev": "queued", "id": "abcd1234", "need_gb": 0},
+        {"ev": "granted"},
+        {"ev": "failed", "exit_code": 124, "error": "lease expired after 1800s (--ttl)"},
+    ]
+    assert cli._stream(iter(failed), label="lease") == 124
+    assert cli._stream(iter([{"ev": "failed"}]), label="lease") == 1
+    assert cli._stream(iter([{"ev": "done", "exit_code": 0}])) == 0
+
+
+def test_a_cancelled_queued_job_lands_in_history_and_stops_shadowing_prefixes():
+    broker = Broker(cfg_for(), Rig())
+    job = broker.submit(argv=["true"])
+    assert broker.cancel(job.id[:4]) is True
+    assert broker.recent[-1]["id"] == job.id
+    assert broker.recent[-1]["state"] == "cancelled"
+    assert job.id not in broker.jobs, "a cancelled job must not shadow a later job's prefix"
+
+
+def test_status_position_follows_priority_not_submission_order():
+    broker = Broker(cfg_for(), Rig())
+    broker.submit(argv=["true"], priority=0)
+    high = broker.submit(argv=["true"], priority=5)
+    snapshot = asyncio.run(broker.status())
+    assert snapshot["queue"][0]["id"] == high.id
+    assert snapshot["queue"][0]["position"] == 1
+
+
+def test_admission_waits_for_a_stopping_baseline_instead_of_refusing():
+    class SlowRelease(Rig):
+        """The baseline keeps reporting memory for a few polls after its unit is stopped."""
+
+        def __init__(self):
+            super().__init__(total_mib=24576, baseline_mib=20000, idle_mib=300)
+            self.release_polls = 3
+
+        def gpu_memory(self, index):
+            if self.units.get("base.service"):
+                return self.total_mib, self.idle_mib + self.baseline_mib
+            if self.release_polls > 0:
+                self.release_polls -= 1
+                return self.total_mib, self.idle_mib + self.baseline_mib
+            return self.total_mib, self.idle_mib
+
+    cfg = cfg_for(
+        {"base": {"kind": "unit", "target": "base.service", "vram_gb": 20, "baseline": True}},
+        poll_seconds=0.02,
+    )
+    broker = Broker(cfg, SlowRelease())
+
+    async def scenario():
+        job = broker.submit(argv=["true"], need_gb=10, ttl=60)
+        await broker._run(job)
+        return job
+
+    job = asyncio.run(scenario())
+    assert job.state == "done", job.error
+
+
+def test_unknown_attribution_is_never_treated_as_an_empty_card():
+    class BlindUnits(Rig):
+        def unit_pids(self, unit):
+            raise RuntimeError("systemctl --user show failed")
+
+    cfg = cfg_for({"heavy": {"kind": "unit", "target": "heavy.service", "vram_gb": 0}})
+    broker = Broker(cfg, BlindUnits())
+    job = broker.submit(argv=["true"], need_gb=4)
+    assert broker._foreign_procs(job) is None, "a failed systemd read must read as unknown, not empty"
 
 
 def test_status_reports_queue_position_and_ttl_clocks():

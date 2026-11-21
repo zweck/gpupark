@@ -38,6 +38,12 @@ class FakeHost(Host):
     def unit_failure(self, unit):
         return None
 
+    def gpu_processes(self):
+        return []
+
+    def unit_pids(self, unit):
+        return set()
+
 
 def cfg_for(workloads):
     return config.parse(

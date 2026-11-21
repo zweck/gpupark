@@ -91,8 +91,9 @@ Ask before doing any of these:
 - **`gpupark cancel`** on a job whose id you do not recognise;
 - **editing `~/.config/gpupark/workloads.yaml`** or restarting `gpupark.service`
   (a daemon restart drops every queued job and marks running leases cancelled);
-- **a job that needs more VRAM than the card has** — it will never fit, and the
-  broker will park the baseline only to fail after `grant_timeout`;
+- **A job that needs more VRAM than the card has** — it will never fit, so 0.4.0 refuses it before
+  the baseline is parked (`22.0 GB requested but gpu 0 has only 20.0 GB in total`); the same
+  preflight refuses a request the card cannot satisfy even with the baseline gone;
 - **holding a lease while you do nothing** (a `sleep`, an interactive prompt, a
   long file download). Take the lease when the work starts, release it when it
   ends; a lease idle for minutes is a bug in your script;

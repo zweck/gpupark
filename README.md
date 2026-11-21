@@ -147,10 +147,16 @@ workload may set `baseline: true`; it is started at daemon boot and after every 
   requested but gpu 0 has only 20.0 GB in total`), and the wait for VRAM is bounded by
   `grant_timeout` — never by the job's `--ttl`, which used to keep the baseline parked for an
   hour when a foreign process held the card.
+- **`run` requires the `--` separator.** Everything after it is the job's argv, so a job can pass its
+  own `--` (Godot's `--editor -- --lm-bake=x`) without gpupark eating it. Without the separator the
+  command is refused rather than silently truncated.
+- **A job that is parking the baseline is `admitting`, not `queued`.** It leaves the queue list, so
+  `status` cannot count it twice; `cancel` stops it cleanly; `pause` refuses it; and its `--ttl`
+  starts at the grant, not while it waits for the card.
 - **Every job's output outlives its client.** Output is tee'd to
-  `<state dir>/logs/<id>.log` (with the exit line), and the last 50 finished jobs are kept in
-  memory for `gpupark history`; a wrapper that dies no longer takes the job's output or its id
-  with it.
+  `<state dir>/logs/<id>.log` (with the exit line, a 64 MB per-job cap and the newest 200 kept),
+  and the last 50 finished jobs are kept in memory for `gpupark history`; a wrapper that dies no
+  longer takes the job's output or its id with it.
 - **A lease belongs to its client; a job belongs to the broker.** Closing the client that
   ran `gpupark lease` (Ctrl-C) releases the lease. A `gpupark run` job keeps running when its
   client goes away — stop it with `gpupark cancel <id>`.
@@ -181,8 +187,11 @@ foreign_tolerance_mib: 512  # ignore allocator dust
 ```
 
 `stop` and `kill` only ever reach a pid that appeared *after* the grant; anything already resident
-is named and left alone. The job's own process tree and the MainPID subtree of every registered
-unit are never treated as foreign. `gpupark status` lists foreign usage as well.
+is named and left alone. The job's own process tree and the MainPID subtree (and process group) of
+every registered unit are never treated as foreign. When the probe or `systemctl` cannot answer, the
+reading is **unknown** (`foreign: unknown…` in `status`): admission is skipped and nothing is
+signalled, because a broker that guesses on an empty reading can shoot its own workload.
+`gpupark status` lists foreign usage as well.
 
 This is accounting, not enforcement: no user-space broker can stop a Vulkan game from allocating
 memory. Driver-level exclusivity (`nvidia-smi -c EXCLUSIVE_PROCESS`) covers CUDA contexts only and

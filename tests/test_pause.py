@@ -36,6 +36,15 @@ class FakeHost(Host):
     def wait_inactive(self, unit, timeout):
         return not self.units.get(unit)
 
+    def unit_failure(self, unit):
+        return None
+
+    def gpu_processes(self):
+        return []
+
+    def unit_pids(self, unit):
+        return set()
+
 
 def cfg_for(workloads):
     return config.parse(

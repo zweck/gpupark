@@ -43,6 +43,10 @@ gpu: 0
 poll_seconds: 0.5
 cooldown_seconds: 8
 grant_timeout: 120
+# lease integrity: VRAM that something outside gpupark takes during a lease
+# foreign_policy: warn     # warn | stop (SIGSTOP) | kill (SIGKILL) — only pids seen AFTER the grant
+# foreign_poll_seconds: 5
+# foreign_tolerance_mib: 512
 
 workloads:
   # the resident model: holds the card whenever nothing else needs it
@@ -96,6 +100,9 @@ class Config:
     grant_timeout: float = 120.0
     socket_path: str = ""
     state_path: str = ""
+    foreign_policy: str = "warn"  # "warn" | "stop" | "kill"
+    foreign_poll_seconds: float = 5.0
+    foreign_tolerance_mib: int = 512  # ignore dust (allocator padding, a stray 200 MiB)
     workloads: dict[str, Workload] = field(default_factory=dict)
 
     def baseline(self) -> Workload | None:
@@ -112,6 +119,20 @@ class Config:
             known = ", ".join(sorted(self.workloads)) or "none"
             raise KeyError(f"unknown workload {name!r} (known: {known})") from None
 
+    def artifacts_dir(self) -> Path:
+        """Where job logs live.
+
+        An existing directory is used as-is; an existing file (or a `*.json` state path) uses its
+        parent; anything else is treated as a directory. A dotted directory name (`gpupark.d`) is
+        therefore still a directory, and `~` is expanded because the value comes from YAML.
+        """
+        path = Path(self.state_path).expanduser()
+        if path.is_dir():
+            return path
+        if path.is_file() or path.suffix == ".json":
+            return path.parent
+        return path
+
 
 def parse(raw: dict[str, Any]) -> Config:
     cfg = Config(
@@ -122,6 +143,9 @@ def parse(raw: dict[str, Any]) -> Config:
         grant_timeout=float(raw.get("grant_timeout", 120.0)),
         socket_path=str(raw.get("socket_path") or default_socket_path()),
         state_path=str(raw.get("state_path") or default_state_path()),
+        foreign_policy=str(raw.get("foreign_policy", "warn")).lower(),
+        foreign_poll_seconds=float(raw.get("foreign_poll_seconds", 5.0)),
+        foreign_tolerance_mib=int(raw.get("foreign_tolerance_mib", 512)),
     )
     for name, raw_entry in (raw.get("workloads") or {}).items():
         entry = dict(raw_entry or {})
@@ -138,8 +162,16 @@ def parse(raw: dict[str, Any]) -> Config:
         workload.check()
         cfg.workloads[name] = workload
     cfg.baseline()  # validates uniqueness
+    if cfg.foreign_policy not in ("warn", "stop", "kill"):
+        raise ValueError(
+            f"foreign_policy must be 'warn', 'stop' or 'kill', not {cfg.foreign_policy!r}"
+        )
     if cfg.gpu_probe not in ("auto", "none"):
         raise ValueError(f"gpu_probe must be 'auto' or 'none', not {cfg.gpu_probe!r}")
+    if cfg.foreign_poll_seconds <= 0:
+        raise ValueError("foreign_poll_seconds must be > 0 (a zero poll spins nvidia-smi)")
+    if cfg.poll_seconds < 0:
+        raise ValueError("poll_seconds must be >= 0")
     return cfg
 
 

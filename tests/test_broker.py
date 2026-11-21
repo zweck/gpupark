@@ -35,6 +35,15 @@ class FakeHost(Host):
     def wait_inactive(self, unit, timeout):
         return not self.units.get(unit)
 
+    def unit_failure(self, unit):
+        return None
+
+    def gpu_processes(self):
+        return []
+
+    def unit_pids(self, unit):
+        return set()
+
 
 def cfg_for(workloads):
     return config.parse(
@@ -64,10 +73,21 @@ def test_baseline_is_parked_then_restored():
     async def scenario():
         await broker._restore_baseline()
         assert host.units["base.service"] is True
-        job = broker.submit(workload_name="heavy", need_gb=20, hold=False, ttl=0.5)
+        job = broker.submit(workload_name="heavy", need_gb=20, hold=False, ttl=60)
         await broker._run(job)
         return job
 
+    # the heavy workload finishes on its own after one check, so the lease ends cleanly (ttl is a ceiling
+    # now, not a way to end a unit: expiring one is a 124 failure)
+    original = host.is_active
+
+    def is_active(unit):
+        if unit == "heavy.service" and host.units.get(unit):
+            host.units[unit] = False
+            return True
+        return original(unit)
+
+    host.is_active = is_active
     job = asyncio.run(scenario())
     assert job.state == "done", job.error
     # parked the baseline before starting the heavy workload, then restored it
@@ -85,7 +105,7 @@ def test_a_job_that_never_fits_fails_with_a_useful_message():
         }
     )
     async def scenario():
-        job = broker.submit(argv=["true"], need_gb=40)
+        job = broker.submit(argv=["true"], need_gb=20)
         await broker._run(job)
         return job
 

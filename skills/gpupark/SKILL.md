@@ -49,8 +49,11 @@ gpupark lease comfyui --for 1800          # hold a registered unit (e.g. a UI se
   high blocks the queue behind a card that will never be that empty; too low and
   your job OOMs after the baseline was already parked.
 - `--ttl` is the lease ceiling in seconds. Always set it for renders and training
-  runs. When it expires the broker stops your workload and restores the baseline; a
-  command job stopped this way exits **124** with `lease expired`, not 0.
+  runs. When it expires the broker stops your workload and restores the baseline; the
+  job exits **124** with `lease expired`, not 0 — for a unit workload too.
+- **A job's output outlives its client.** Everything the job prints is tee'd to
+  `<state dir>/logs/<id>.log`, and `gpupark logs <id>` (or `gpupark history`) reads it
+  back after a killed wrapper, so a lost terminal never means lost output.
 - `--priority` is higher-first, FIFO on ties. Leave it at 0 unless the human asked
   you to jump the queue.
 - The command's stdout/stderr stream to you and its exit code becomes `gpupark`'s.
@@ -88,8 +91,9 @@ Ask before doing any of these:
 - **`gpupark cancel`** on a job whose id you do not recognise;
 - **editing `~/.config/gpupark/workloads.yaml`** or restarting `gpupark.service`
   (a daemon restart drops every queued job and marks running leases cancelled);
-- **a job that needs more VRAM than the card has** — it will never fit, and the
-  broker will park the baseline only to fail after `grant_timeout`;
+- **A job that needs more VRAM than the card has** — it will never fit, so 0.4.0 refuses it before
+  the baseline is parked (`22.0 GB requested but gpu 0 has only 20.0 GB in total`); the same
+  preflight refuses a request the card cannot satisfy even with the baseline gone;
 - **holding a lease while you do nothing** (a `sleep`, an interactive prompt, a
   long file download). Take the lease when the work starts, release it when it
   ends; a lease idle for minutes is a bug in your script;

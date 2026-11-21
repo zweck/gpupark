@@ -69,6 +69,95 @@ def _fail(message: str, code: int = 1) -> int:
     return code
 
 
+def _dur(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def _clock(job: dict) -> str:
+    """', up 12m, ttl 28m left' — the clocks an agent would otherwise have to infer."""
+    bits = []
+    active = job.get("active_seconds")
+    if active is not None:
+        bits.append(f"up {_dur(active)}")
+    left = job.get("ttl_remaining")
+    if left is not None:
+        bits.append(f"ttl {_dur(left)} left")
+    elif job.get("started_at"):
+        bits.append("no ttl")
+    return (", " + ", ".join(bits)) if bits else ""
+
+
+def _state_dir() -> Path:
+    with contextlib.suppress(Exception):
+        return config_mod.load().artifacts_dir()
+    return config_mod.default_state_path().parent
+
+
+def _tail(path: Path, lines: int) -> list[str]:
+    """Last `lines` lines without reading a whole (possibly huge) log into memory."""
+    if lines <= 0:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+    block = 64 * 1024
+    data = b""
+    with path.open("rb") as handle:
+        handle.seek(0, 2)
+        position = handle.tell()
+        while position > 0 and data.count(b"\n") <= lines:
+            step = min(block, position)
+            position -= step
+            handle.seek(position)
+            data = handle.read(step) + data
+    return data.decode("utf-8", errors="replace").splitlines()[-lines:]
+
+
+def _stream(events, *, quiet: bool = False, label: str = "run", grant_message: str | None = None) -> int:
+    """Drive a submitted job's event stream and return its exit code.
+
+    Shared by `run` and `lease`. `failed` carries the broker's own exit code (124 for a TTL
+    expiry, 1 for a refusal) and a failure with no code still exits non-zero — the reason a
+    `gpupark lease --for` that hit its deadline must not look like a success.
+    """
+    code = 0
+    for event in events:
+        kind = event.get("ev")
+        if kind == "output":
+            typer.echo(event.get("line", ""))
+        elif kind == "queued" and not quiet:
+            typer.echo(f"queued {event['id']} (need {float(event.get('need_gb') or 0):.1f} GB)", err=True)
+        elif kind == "admitting" and not quiet:
+            typer.echo("preparing (parking the baseline)", err=True)
+        elif kind == "granted" and not quiet:
+            typer.echo(grant_message or "granted", err=True)
+        elif kind == "foreign" and not quiet:
+            procs = event.get("processes") or []
+            who = ", ".join(
+                f"pid {item['pid']} {item['name']} {item['used_mib'] / 1024:.1f} GB" for item in procs
+            )
+            if event.get("blocked"):
+                typer.echo(f"refusing to grant: foreign GPU use — {who}", err=True)
+            elif event.get("unknown"):
+                typer.echo("warning: GPU attribution unavailable; admission skipped", err=True)
+            elif procs:
+                typer.echo(f"warning: foreign GPU use — {who}", err=True)
+        elif kind == "done":
+            return int(event.get("exit_code") or 0)
+        elif kind == "failed":
+            code = int(event.get("exit_code") or 0) or 1
+            typer.echo(event.get("error") or f"the {label} failed (exit {code})", err=True)
+            return code
+        elif kind == "cancelled":
+            return 130
+        elif "error" in event:
+            typer.echo(str(event["error"]), err=True)
+            return 1
+    return code
+
+
 # ----------------------------------------------------------------- daemon
 
 @app.command()
@@ -127,32 +216,55 @@ def run(
     quiet: bool = typer.Option(False, "--quiet", help="only stream the job's own output"),
 ) -> None:
     """Queue a command; it runs when the GPU is free."""
-    argv: list[str] = [a for a in ctx.args if a != "--"]
+    # Click drops every '--' it parses, so a job's own '--' would vanish (Godot's editor bake is
+    # `godot --editor -- --lm-bake=x`). Rebuild the job argv from the real command line instead:
+    # everything after the FIRST '--' belongs to the job. Requiring that separator is deliberate —
+    # without it, a job's own '--' would be mistaken for ours and the command silently truncated.
+    _raw = sys.argv[1:]
+    if "--" not in _raw:
+        raise typer.BadParameter(
+            "put the job command after '--' (gpupark run --need 8 -- my-job --flag), so gpupark "
+            "can tell its own flags from the job's"
+        )
+    argv = _raw[_raw.index("--") + 1:]
     if not argv:
         raise typer.BadParameter("give a command after '--'")
-    code = 0
-    for event in _call(
-        {"op": "submit", "argv": argv, "need_gb": need, "priority": priority, "ttl": ttl}, stream=True
-    ):
-        kind = event.get("ev")
-        if kind == "output":
-            typer.echo(event.get("line", ""))
-        elif kind == "queued" and not quiet:
-            typer.echo(f"queued {event['id']} (need {need:.1f} GB, priority {priority})", err=True)
-        elif kind == "granted" and not quiet:
-            typer.echo("granted", err=True)
-        elif kind in ("done", "failed"):
-            code = int(event.get("exit_code") or 0)
-            if kind == "failed" and event.get("error"):
-                typer.echo(event["error"], err=True)
-                code = code or 1
-            break
-        elif kind in ("cancelled",):
-            code = 130
-            break
-        elif "error" in event:
-            raise typer.Exit(_fail(event["error"]))
-    raise typer.Exit(code)
+    # `run` takes no positional arguments of its own, so Click's leftover args must be exactly the
+    # job command. When they differ, the `--` we split on was the JOB's own separator and the command
+    # would be silently truncated — refuse it instead.
+    if [token for token in argv if token != "--"] != list(ctx.args):
+        raise typer.BadParameter(
+            "gpupark run takes no positional arguments before '--': put the whole job command "
+            "after it (gpupark run --need 8 -- my-job --flag)"
+        )
+    try:
+        from click.core import ParameterSource
+
+        need_given = ctx.get_parameter_source("need") is ParameterSource.COMMANDLINE
+    except Exception:
+        head = _raw[:_raw.index("--")]
+        need_given = any(item == "--need" or item.startswith("--need=") for item in head)
+    if not need_given and not quiet:
+        typer.echo(
+            "warning: no --need given — the baseline is not parked and the job runs beside the "
+            "resident model; pass --need <GB> for GPU work",
+            err=True,
+        )
+    raise typer.Exit(
+        _stream(
+            _call(
+                {
+                    "op": "submit",
+                    "argv": argv,
+                    "need_gb": need,
+                    "priority": priority,
+                    "ttl": ttl,
+                },
+                stream=True,
+            ),
+            quiet=quiet,
+        )
+    )
 
 
 @app.command()
@@ -161,24 +273,23 @@ def lease(
     ttl: float | None = typer.Option(None, "--for", help="hold for N seconds, then release"),
 ) -> None:
     """Start a registered workload and hold the GPU until this command is interrupted."""
-    for event in _call({"op": "submit", "workload": workload, "ttl": ttl, "hold": True}, stream=True):
-        kind = event.get("ev")
-        if kind == "queued":
-            typer.echo(f"queued {event['id']}", err=True)
-        elif kind == "granted":
-            typer.echo(f"{workload} holds the GPU; Ctrl-C to release", err=True)
-        elif kind in ("done", "failed", "cancelled"):
-            break
-        elif "error" in event:
-            raise typer.Exit(_fail(event["error"]))
+    raise typer.Exit(
+        _stream(
+            _call({"op": "submit", "workload": workload, "ttl": ttl, "hold": True}, stream=True),
+            label="lease",
+            grant_message=f"{workload} holds the GPU; Ctrl-C to release",
+        )
+    )
 
 
 @app.command()
 def cancel(job_id: str) -> None:
-    """Cancel a queued job or stop a running one."""
+    """Cancel a queued job, or stop a running one (an id prefix is enough when it is unique)."""
     for event in _call({"op": "cancel", "id": job_id}):
-        typer.echo("cancelled" if event.get("cancelled") else f"no such live job: {job_id}")
-        raise typer.Exit(0 if event.get("cancelled") else 1)
+        if event.get("cancelled"):
+            typer.echo("cancelled")
+            raise typer.Exit(0)
+        raise typer.Exit(_fail(event.get("error") or f"no live job matching {job_id!r}"))
 
 
 def _current_job_id() -> str | None:
@@ -264,17 +375,99 @@ def status(as_json: bool = typer.Option(False, "--json")) -> None:
         typer.echo(f"baseline: {meta.get('name') or '-'} ({meta.get('state')})")
         if running:
             what = running.get("workload") or " ".join(running.get("argv") or [])
-            typer.echo(f"lease: {running['id']} {what} (need {running['need_gb']:.1f} GB)")
+            if running.get("state") == "admitting":
+                typer.echo(
+                    f"lease: {running['id']} {what} (need {running['need_gb']:.1f} GB, preparing)"
+                )
+            else:
+                pid = running.get("pid")
+                seats = f", pid {pid}" if pid else ""
+                typer.echo(
+                    f"lease: {running['id']} {what} (need {running['need_gb']:.1f} GB"
+                    f"{_clock(running)}{seats})"
+                )
         else:
             typer.echo("lease: free")
+        foreign = snapshot.get("foreign") or []
+        if foreign:
+            who = ", ".join(
+                f"pid {p['pid']} {p['name']} {p['used_mib'] / 1024:.1f} GB" for p in foreign
+            )
+            typer.echo(f"foreign: {who}")
+        elif snapshot.get("foreign_unknown"):
+            typer.echo("foreign: unknown (probe or systemd could not attribute GPU memory)")
         queue = snapshot.get("queue") or []
         typer.echo(f"queue: {len(queue)}")
         for job in queue:
             what = job.get("workload") or " ".join(job.get("argv") or [])
-            typer.echo(f"  {job['id']}  {what}  (need {job['need_gb']:.1f} GB)")
+            waiting = job.get("queued_for")
+            waited = f", waiting {_dur(waiting)}" if waiting is not None else ""
+            typer.echo(
+                f"  {job.get('position', '?')}. {job['id']}  {what}  "
+                f"(need {job['need_gb']:.1f} GB{waited})"
+            )
         for job in snapshot.get("paused") or []:
             what = job.get("workload") or " ".join(job.get("argv") or [])
             typer.echo(f"  paused: {job['id']}  {what}  (need {job['need_gb']:.1f} GB) — 'gpupark resume'")
+
+
+@app.command()
+def history(
+    as_json: bool = typer.Option(False, "--json"),
+    limit: int = typer.Option(20, "--limit", help="how many of the most recent jobs to show"),
+) -> None:
+    """Show recently finished jobs: exit code, how long they waited and ran."""
+    for snapshot in _call({"op": "history"}):
+        rows = list(snapshot.get("recent") or [])[-limit:] if limit > 0 else []
+        if as_json:
+            typer.echo(json.dumps(rows, indent=2))
+            return
+        if not rows:
+            typer.echo("no finished jobs yet")
+            return
+        for row in rows:
+            what = row.get("workload") or " ".join(row.get("argv") or [])
+            bits = []
+            if row.get("exit_code") is not None:
+                bits.append(f"exit {row['exit_code']}")
+            if row.get("wait_seconds") is not None:
+                bits.append(f"queued {_dur(row['wait_seconds'])}")
+            if row.get("run_seconds") is not None:
+                bits.append(f"ran {_dur(row['run_seconds'])}")
+            typer.echo(f"{row['id']}  {str(row.get('state')):<9} {what}  ({', '.join(bits)})")
+            if row.get("error"):
+                typer.echo(f"    {row['error']}")
+
+
+@app.command()
+def logs(
+    job_id: str = typer.Argument(..., help="job id, or a unique prefix"),
+    lines: int = typer.Option(200, "--lines", "-n", help="how many trailing lines to print"),
+    path_only: bool = typer.Option(False, "--path", help="print the log path instead of its text"),
+) -> None:
+    """Print a job's own output log, so a lost client does not lose the job's output."""
+    token = job_id.strip().lower()
+    if not token or any(bad in token for bad in ("/", "\\", "*", "?", "[", "]", "..")):
+        raise typer.Exit(_fail(f"{job_id!r} is not a job id (or a unique prefix)"))
+    log_dir = _state_dir() / "logs"
+    matches = (
+        sorted(item for item in log_dir.iterdir() if item.suffix == ".log" and item.stem.startswith(token))
+        if log_dir.is_dir()
+        else []
+    )
+    if not matches:
+        raise typer.Exit(_fail(f"no log for job {job_id!r} in {log_dir}"))
+    if len(matches) > 1:
+        names = ", ".join(item.stem for item in matches[:6])
+        raise typer.Exit(
+            _fail(f"{job_id!r} matches {len(matches)} logs ({names}); give more characters")
+        )
+    target = matches[0]
+    if path_only:
+        typer.echo(str(target))
+        return
+    for line in _tail(target, lines):
+        typer.echo(line)
 
 
 @app.command()

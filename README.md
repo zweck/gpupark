@@ -60,6 +60,8 @@ gpupark lease comfyui --for 3600                    # hold a registered unit
 gpupark pause [ID]                                  # give the card back, keep your place
 gpupark resume [ID]                                 # take it again
 gpupark status | cancel <id> | workloads | doctor
+gpupark history                                     # what finished, how long it waited and ran
+gpupark logs <id>                                   # a job's own output, even if its client died
 ```
 
 ## Pausing
@@ -117,10 +119,12 @@ workload may set `baseline: true`; it is started at daemon boot and after every 
 |---|---|
 | `gpupark run --need 22 -- CMD...` | queue an ad-hoc command, wait for the lease, run it |
 | `gpupark lease comfyui --for 1800` | start a registered unit and hold the card for N seconds |
-| `gpupark status` | lease, queue, VRAM, baseline state |
-| `gpupark cancel ID` | drop a queued job or stop a running one |
+| `gpupark status` | lease, queue, VRAM, baseline state, and the clocks (`up`, `ttl left`, `waiting`) |
+| `gpupark cancel ID` | drop a queued job or stop a running one (an id prefix is enough when unique) |
 | `gpupark pause [ID]` | hand the card back; keep the lease and the queue place |
 | `gpupark resume [ID]` | re-grant a paused lease, or requeue a paused job |
+| `gpupark history` | the last 50 finished jobs: exit code, queue wait, run time, error |
+| `gpupark logs ID` | that job's own output, teed to `<state>/logs/<id>.log` (`--path`, `--lines`) |
 | `gpupark doctor` | check the config, nvidia-smi, systemd and the daemon |
 | `gpupark daemon` | run the broker in the foreground (what the unit runs) |
 
@@ -133,8 +137,26 @@ workload may set `baseline: true`; it is started at daemon boot and after every 
 - **The baseline is the only workload that may be preempted.** A running job is never
   evicted by a later arrival.
 - **The TTL is running time, not wall time.** Time spent paused is subtracted before the
-  deadline is checked. A command job stopped by its `--ttl` exits **124** with `lease
-  expired`; a unit lease that reaches its `--for` simply ends.
+  deadline is checked. A job stopped by its `--ttl` exits **124** with `lease expired`, and
+  that now holds for a unit workload too: reaching `--for` stops the unit and fails the lease
+  instead of reporting success.
+- **A unit that dies is a failure, not a clean finish.** When a workload's unit goes inactive
+  the broker asks systemd why (`Result` / `ExecMainStatus`); anything other than `success/0`
+  fails the lease with `stopped unexpectedly (Result=exit-code ExecMainStatus=3)`.
+- **A request larger than the card is refused before the baseline is parked** (`22.0 GB
+  requested but gpu 0 has only 20.0 GB in total`), and the wait for VRAM is bounded by
+  `grant_timeout` — never by the job's `--ttl`, which used to keep the baseline parked for an
+  hour when a foreign process held the card.
+- **`run` requires the `--` separator.** Everything after it is the job's argv, so a job can pass its
+  own `--` (Godot's `--editor -- --lm-bake=x`) without gpupark eating it. Without the separator the
+  command is refused rather than silently truncated.
+- **A job that is parking the baseline is `admitting`, not `queued`.** It leaves the queue list, so
+  `status` cannot count it twice; `cancel` stops it cleanly; `pause` refuses it; and its `--ttl`
+  starts at the grant, not while it waits for the card.
+- **Every job's output outlives its client.** Output is tee'd to
+  `<state dir>/logs/<id>.log` (with the exit line, a 64 MB per-job cap and the newest 200 kept),
+  and the last 50 finished jobs are kept in memory for `gpupark history`; a wrapper that dies no
+  longer takes the job's output or its id with it.
 - **A lease belongs to its client; a job belongs to the broker.** Closing the client that
   ran `gpupark lease` (Ctrl-C) releases the lease. A `gpupark run` job keeps running when its
   client goes away — stop it with `gpupark cancel <id>`.
@@ -142,6 +164,38 @@ workload may set `baseline: true`; it is started at daemon boot and after every 
   and can leave a running child or unit behind with no owner (the socket is stale, and the
   next start removes it). Restart the broker and check `gpupark status` for leftovers;
   journaling is not implemented yet.
+
+## Lease integrity
+
+A lease is only worth what the card actually does. gpupark watches for VRAM taken by processes it
+does not manage — a game, a stray script, a second UI. Those are invisible to the queue, and they
+turn a healthy render into a mid-sampler allocation failure (`CUDA error 2`, which ComfyUI surfaces
+as `Fault failed: 2` and reads like a broken graph).
+
+Two hooks, both fed by `nvidia-smi --query-compute-apps`:
+
+- **Admission.** After the baseline is parked, a job that cannot fit because something else holds
+  memory is refused *before* it starts, with the offending processes named:
+  `refusing to grant: 3.8 GB free, 22.0 GB requested, and pid 3486725 ApexGP.x86_64 (3.4 GB) is held by processes gpupark does not manage`.
+- **Watch.** During a lease, a poll notices new allocations and reports them:
+  `gpupark: pid 3486725 ApexGP.x86_64 (3.4 GB) took VRAM during lease <id> (foreign_policy=warn)`.
+
+```yaml
+foreign_policy: warn        # warn (default) | stop (SIGSTOP) | kill (SIGKILL)
+foreign_poll_seconds: 5
+foreign_tolerance_mib: 512  # ignore allocator dust
+```
+
+`stop` and `kill` only ever reach a pid that appeared *after* the grant; anything already resident
+is named and left alone. The job's own process tree and the MainPID subtree (and process group) of
+every registered unit are never treated as foreign. When the probe or `systemctl` cannot answer, the
+reading is **unknown** (`foreign: unknown…` in `status`): admission is skipped and nothing is
+signalled, because a broker that guesses on an empty reading can shoot its own workload.
+`gpupark status` lists foreign usage as well.
+
+This is accounting, not enforcement: no user-space broker can stop a Vulkan game from allocating
+memory. Driver-level exclusivity (`nvidia-smi -c EXCLUSIVE_PROCESS`) covers CUDA contexts only and
+needs root, so it is not something gpupark flips on your behalf.
 
 ## Security model
 
